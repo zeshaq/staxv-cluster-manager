@@ -7,6 +7,7 @@ import Home from './pages/Home'
 import Servers from './pages/Servers'
 import ServerDetail from './pages/ServerDetail'
 import Fleet from './pages/Fleet'
+import ISOs from './pages/ISOs'
 import Users from './pages/Users'
 import Settings from './pages/Settings'
 
@@ -55,6 +56,7 @@ export default function App() {
                 <Route path="/servers"        element={<Servers />} />
                 <Route path="/servers/:id"    element={<ServerDetail />} />
                 <Route path="/fleet"     element={<Fleet />} />
+                <Route path="/isos"      element={<ISOs />} />
                 <Route path="/users"     element={<Users />} />
                 <Route path="/settings"  element={<Settings />} />
                 <Route path="*"          element={<Navigate to="/" replace />} />

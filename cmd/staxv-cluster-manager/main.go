@@ -35,6 +35,7 @@ import (
 	"github.com/zeshaq/staxv-cluster-manager/internal/config"
 	"github.com/zeshaq/staxv-cluster-manager/internal/db"
 	"github.com/zeshaq/staxv-cluster-manager/internal/handlers"
+	"github.com/zeshaq/staxv-cluster-manager/internal/isolib"
 	"github.com/zeshaq/staxv-cluster-manager/internal/webui"
 	"github.com/zeshaq/staxv-cluster-manager/pkg/auth"
 	"github.com/zeshaq/staxv-cluster-manager/pkg/pamauth"
@@ -159,39 +160,67 @@ func cmdServe(args []string) {
 	}
 	settingsStore := db.NewSettingsStore(store, aead)
 	serverStore := db.NewServerStore(store, aead)
+	isoStore := db.NewISOStore(store)
+
+	// ISO library root. Created 0755 on first boot so fresh clones
+	// don't need a provisioning step. In prod, override via config to
+	// /var/lib/staxv-cluster-manager/isos on a big filesystem.
+	isoLib, err := isolib.New(cfg.ISOs.Path)
+	if err != nil {
+		slog.Error("init iso library", "err", err, "path", cfg.ISOs.Path)
+		os.Exit(1)
+	}
+	slog.Info("iso library", "path", isoLib.Root(),
+		"max_upload_gb", cfg.ISOs.MaxUploadGB,
+		"download_timeout", cfg.ISOs.DownloadTimeout,
+	)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.Timeout(60 * time.Second))
 
-	r.Get("/healthz", healthzHandler)
+	// Default group: 60s timeout covers quick JSON requests. ISO routes
+	// sit OUTSIDE this group — multi-GB uploads, background-download
+	// kickoffs, and chassis-speed ISO streaming all routinely exceed
+	// 60s, and a killed-midstream upload is a worse experience than a
+	// slow endpoint locking a goroutine.
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Timeout(60 * time.Second))
 
-	authH := handlers.NewAuthHandler(verifier, signer, cfg.Server.Secure)
-	authH.Mount(r, authMW)
+		r.Get("/healthz", healthzHandler)
 
-	settingsH := handlers.NewSettingsHandler(settingsStore)
-	settingsH.Mount(r, authMW)
+		authH := handlers.NewAuthHandler(verifier, signer, cfg.Server.Secure)
+		authH.Mount(r, authMW)
 
-	hostH := handlers.NewHostHandler()
-	hostH.Mount(r, authMW)
+		settingsH := handlers.NewSettingsHandler(settingsStore)
+		settingsH.Mount(r, authMW)
 
-	// Dashboard — reports metrics for the CM host itself. When fleet
-	// features land, there will be a separate /api/fleet/dashboard
-	// that aggregates across hypervisors; this one stays for "am I
-	// healthy as the control plane?"
-	dashH := handlers.NewDashboardHandler()
-	dashH.Mount(r, authMW)
+		hostH := handlers.NewHostHandler()
+		hostH.Mount(r, authMW)
 
-	// Physical servers — Redfish (iLO/iDRAC) inventory. Admin-only.
-	// Enrollment probes the BMC and stamps reachability immediately
-	// so the UI shows status right after form submit.
-	serversH := handlers.NewServersHandler(serverStore)
-	serversH.Mount(r, authMW)
+		// Dashboard — reports metrics for the CM host itself. When fleet
+		// features land, there will be a separate /api/fleet/dashboard
+		// that aggregates across hypervisors; this one stays for "am I
+		// healthy as the control plane?"
+		dashH := handlers.NewDashboardHandler()
+		dashH.Mount(r, authMW)
+
+		// Physical servers — Redfish (iLO/iDRAC) inventory. Admin-only.
+		serversH := handlers.NewServersHandler(serverStore)
+		serversH.Mount(r, authMW)
+	})
+
+	// ISO library — both authenticated /api/isos/* (admin-only) AND the
+	// public /iso/{id}/{filename} serve route (BMCs fetch here for
+	// Virtual Media Insert, can't send our session cookie).
+	maxUpload := int64(cfg.ISOs.MaxUploadGB) * 1024 * 1024 * 1024
+	isosH := handlers.NewISOsHandler(isoStore, isoLib, maxUpload, cfg.ISOs.DownloadTimeout)
+	isosH.Mount(r, authMW)
 
 	// Web UI — React app embedded via embed.FS. Empty on fresh clone
-	// (placeholder until `make frontend` runs).
+	// (placeholder until `make frontend` runs). Registered LAST so the
+	// SPA fallback doesn't shadow the specific routes above.
 	r.Handle("/*", webui.Handler())
 
 	srv := &http.Server{

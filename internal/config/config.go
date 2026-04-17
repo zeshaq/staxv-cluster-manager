@@ -1,9 +1,10 @@
 // Package config loads staxv-cluster-manager's TOML config.
 //
 // Narrower than staxv-hypervisor's config: no [libvirt] (CM talks gRPC
-// to hypervisors, not libvirtd directly) and no [isos]/[host] (those
-// are hypervisor-level concerns). Fleet-specific sections — hypervisor
-// enrollment, gRPC TLS — will land here as those features arrive.
+// to hypervisors, not libvirtd directly). Fleet-specific sections —
+// hypervisor enrollment, gRPC TLS — will land here as those features
+// arrive. [isos] lives here because OS-install media is a CM-level
+// resource (bound to physical servers, not per-hypervisor tenants).
 package config
 
 import (
@@ -38,6 +39,24 @@ type Config struct {
 	Secrets struct {
 		KeyPath string `toml:"key_path"` // 32-byte AES-256 key
 	} `toml:"secrets"`
+
+	ISOs struct {
+		// Path is the root directory for uploaded / downloaded ISO files.
+		// Created on first boot if missing. BMCs fetch ISOs by HTTP URL
+		// via Virtual Media Insert, so this directory's contents are
+		// what gets served at /iso/{id}/{filename}.
+		Path string `toml:"path"`
+
+		// MaxUploadGB caps a single multipart upload. 20 GB covers the
+		// largest distro ISO (Windows Server + optional bits) with
+		// headroom. Set to 0 to inherit the default.
+		MaxUploadGB int `toml:"max_upload_gb"`
+
+		// DownloadTimeout caps URL-import download time. Fast mirrors
+		// do a typical 4-8 GB Linux ISO in ~1-2 min on LAN; keeping a
+		// generous ceiling lets slow mirrors and WAN fetches complete.
+		DownloadTimeout time.Duration `toml:"download_timeout"`
+	} `toml:"isos"`
 }
 
 // Load reads the TOML file at path and fills in defaults. Missing file
@@ -87,5 +106,19 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Secrets.KeyPath == "" {
 		c.Secrets.KeyPath = "./tmp/settings.key"
+	}
+	if c.ISOs.Path == "" {
+		// ./tmp/isos in dev; prod deployments override with
+		// /var/lib/staxv-cluster-manager/isos.
+		c.ISOs.Path = "./tmp/isos"
+	}
+	if c.ISOs.MaxUploadGB == 0 {
+		c.ISOs.MaxUploadGB = 20
+	}
+	if c.ISOs.DownloadTimeout == 0 {
+		// 2 hours — ESXi ISOs from VMware's mirror can crawl at ~10 MB/s
+		// on a cold CDN; don't kill the download mid-flight just because
+		// the upstream is slow.
+		c.ISOs.DownloadTimeout = 2 * time.Hour
 	}
 }

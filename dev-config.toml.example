@@ -25,3 +25,14 @@ ttl = "24h"
 # 32-byte AES-256 key for encrypting /api/settings values.
 # Auto-generated 0600 on first run. Back this up in prod.
 key_path = "./tmp/settings.key"
+
+[isos]
+# Where uploaded / URL-imported install ISOs live on disk.
+# Auto-created 0755 on boot if missing. In prod use
+# /var/lib/staxv-cluster-manager/isos on a big filesystem.
+path = "./tmp/isos"
+# Cap for a single multipart upload, in gibibytes.
+max_upload_gb = 20
+# Per-download timeout for URL imports. Large ESXi ISOs on slow mirrors
+# can take well over an hour; don't kill mid-transfer.
+download_timeout = "2h"
