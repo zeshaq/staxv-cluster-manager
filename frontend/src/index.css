@@ -1,0 +1,41 @@
+@import url('https://rsms.me/inter/inter.css');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ──────────────────────────────────────────────────────────────
+   Global canvas — teal-tinted near-black. Matches tailwind.config
+   canvas.900. Applied on <body> by index.html for the first paint
+   (before React mounts and Tailwind utilities take over).
+   ────────────────────────────────────────────────────────────── */
+body {
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  background: #050e14;
+}
+
+/* Scrollbar — matches the dark-teal canvas. Keeps the UI from
+   flashing a bright white scrollbar on dark pages. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: #050e14;
+}
+::-webkit-scrollbar-thumb {
+  background: #1e4451;
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2a5a68;
+}
+
+/* Subtle animated gradient used by the page-hero border on Home. */
+@keyframes shimmer {
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 1; }
+}
+.hero-glow {
+  animation: shimmer 4s ease-in-out infinite;
+}
