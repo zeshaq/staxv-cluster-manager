@@ -53,6 +53,10 @@ func (h *NetworkDevicesHandler) Mount(r chi.Router, authMW func(http.Handler) ht
 		r.Delete("/{id}/vlans/{vlan_id}", h.DeleteVLAN)
 		r.Get("/{id}/interfaces", h.ListInterfaces)
 		r.Post("/{id}/interface-ip", h.SetInterfaceIP)
+		r.Get("/{id}/ospf", h.GetOSPF)
+		r.Post("/{id}/ospf/processes", h.UpsertOSPFProcess)
+		r.Delete("/{id}/ospf/processes/{pid}", h.DeleteOSPFProcess)
+		r.Post("/{id}/ospf/interface", h.SetOSPFInterface)
 	})
 }
 
@@ -515,6 +519,177 @@ func (h *NetworkDevicesHandler) SetInterfaceIP(w http.ResponseWriter, r *http.Re
 	ifaces, _ := cli.Interfaces(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"interfaces":    ifaces,
+		"config_before": before,
+		"config_after":  after,
+	})
+}
+
+// ─── OSPF ────────────────────────────────────────────────────────
+//
+// Process list + create + delete + per-interface attach with
+// optional network type (the "point-to-point" admins use for /30
+// WAN links so neighbors form without DR/BDR election). Neighbor
+// table is read-only observation.
+
+// GetOSPF runs all three OSPF queries (show run section + show ip
+// ospf interface brief + show ip ospf neighbor) and returns one
+// bundled response. Per-block errors surface via the *_error fields
+// so partial failure is visible without failing the whole call.
+func (h *NetworkDevicesHandler) GetOSPF(w http.ResponseWriter, r *http.Request) {
+	cli, _, ok := h.clientForDevice(w, r)
+	if !ok {
+		return
+	}
+	defer cli.Close()
+	state, err := cli.GetOSPFState(r.Context())
+	if err != nil {
+		h.writeCiscoErr(w, err, "ospf state")
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
+// upsertOSPFProcessRequest is the payload for enabling or updating
+// an OSPF process. Idempotent — re-running with a new router-id
+// overwrites the old one.
+type upsertOSPFProcessRequest struct {
+	PID      int    `json:"pid"`
+	RouterID string `json:"router_id"`
+}
+
+// UpsertOSPFProcess creates or updates `router ospf <pid>` with the
+// given router-id. Useful for both first-time enable and for rotating
+// a router-id.
+func (h *NetworkDevicesHandler) UpsertOSPFProcess(w http.ResponseWriter, r *http.Request) {
+	var req upsertOSPFProcessRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid body (expected {\"pid\":N,\"router_id\":\"...\"})", http.StatusBadRequest)
+		return
+	}
+	if req.PID < 1 || req.PID > 65535 {
+		writeError(w, "pid must be 1-65535", http.StatusBadRequest)
+		return
+	}
+	cli, devName, ok := h.clientForDevice(w, r)
+	if !ok {
+		return
+	}
+	defer cli.Close()
+
+	before, after, err := cli.CreateOrUpdateOSPFProcess(r.Context(), req.PID, req.RouterID)
+	if err != nil {
+		slog.Warn("ospf process upsert failed",
+			"device", devName, "pid", req.PID, "router_id", req.RouterID,
+			"err", err, "config_before", before, "config_after", after)
+		h.writeCiscoErr(w, err, "upsert ospf process")
+		return
+	}
+	slog.Info("ospf process upserted",
+		"device", devName, "pid", req.PID, "router_id", req.RouterID,
+		"config_before", before, "config_after", after)
+
+	state, _ := cli.GetOSPFState(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"state":         state,
+		"config_before": before,
+		"config_after":  after,
+	})
+}
+
+// DeleteOSPFProcess removes `router ospf <pid>`. IOS cleans up
+// interface attachments for this pid automatically on process
+// removal. Idempotent — deleting a non-existent process is fine.
+func (h *NetworkDevicesHandler) DeleteOSPFProcess(w http.ResponseWriter, r *http.Request) {
+	pidStr := chi.URLParam(r, "pid")
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil || pid < 1 || pid > 65535 {
+		writeError(w, fmt.Sprintf("invalid pid %q", pidStr), http.StatusBadRequest)
+		return
+	}
+	cli, devName, ok := h.clientForDevice(w, r)
+	if !ok {
+		return
+	}
+	defer cli.Close()
+
+	before, after, err := cli.DeleteOSPFProcess(r.Context(), pid)
+	if err != nil {
+		slog.Warn("ospf process delete failed",
+			"device", devName, "pid", pid,
+			"err", err, "config_before", before, "config_after", after)
+		h.writeCiscoErr(w, err, "delete ospf process")
+		return
+	}
+	slog.Info("ospf process deleted",
+		"device", devName, "pid", pid,
+		"config_before", before, "config_after", after)
+
+	state, _ := cli.GetOSPFState(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"state":         state,
+		"config_before": before,
+		"config_after":  after,
+	})
+}
+
+// setOSPFInterfaceRequest is the payload for per-interface OSPF
+// attach / detach. pid=0 clears. network_type is optional; empty
+// = don't touch (unless clearing, in which case we also reset).
+type setOSPFInterfaceRequest struct {
+	Name        string `json:"name"`
+	PID         int    `json:"pid"`   // 0 = clear
+	Area        string `json:"area"`  // required when pid > 0
+	NetworkType string `json:"network_type,omitempty"`
+}
+
+func (h *NetworkDevicesHandler) SetOSPFInterface(w http.ResponseWriter, r *http.Request) {
+	var req setOSPFInterfaceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Area = strings.TrimSpace(req.Area)
+	req.NetworkType = strings.TrimSpace(req.NetworkType)
+
+	if !cisco.InterfaceNameRE.MatchString(req.Name) {
+		writeError(w, "invalid interface name", http.StatusBadRequest)
+		return
+	}
+	if req.PID < 0 || req.PID > 65535 {
+		writeError(w, "pid must be 0 (clear) or 1-65535", http.StatusBadRequest)
+		return
+	}
+	if req.PID > 0 && req.Area == "" {
+		writeError(w, "area is required when pid > 0", http.StatusBadRequest)
+		return
+	}
+	if !cisco.OSPFNetworkTypes[req.NetworkType] {
+		writeError(w, "invalid network_type (valid: point-to-point, point-to-multipoint, broadcast, non-broadcast, or empty)", http.StatusBadRequest)
+		return
+	}
+
+	cli, devName, ok := h.clientForDevice(w, r)
+	if !ok {
+		return
+	}
+	defer cli.Close()
+
+	before, after, err := cli.SetOSPFInterface(r.Context(), req.Name, req.PID, req.Area, req.NetworkType)
+	if err != nil {
+		slog.Warn("ospf interface set failed",
+			"device", devName, "iface", req.Name, "pid", req.PID, "area", req.Area, "network_type", req.NetworkType,
+			"err", err, "config_before", before, "config_after", after)
+		h.writeCiscoErr(w, err, "set ospf interface")
+		return
+	}
+	slog.Info("ospf interface set",
+		"device", devName, "iface", req.Name, "pid", req.PID, "area", req.Area, "network_type", req.NetworkType,
+		"config_before", before, "config_after", after)
+
+	state, _ := cli.GetOSPFState(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"state":         state,
 		"config_before": before,
 		"config_after":  after,
 	})

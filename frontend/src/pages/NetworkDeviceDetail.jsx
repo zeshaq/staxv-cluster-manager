@@ -5,7 +5,7 @@ import {
   Router, RefreshCw, Trash2, CheckCircle, XCircle,
   AlertTriangle, HelpCircle, Cpu, MemoryStick, Tag, Network as NetIcon,
   Thermometer, Key, Gauge, Activity, Layers, Plus,
-  Pencil, Check as CheckIcon, X as XIcon,
+  Pencil, Check as CheckIcon, X as XIcon, Share2, Users,
 } from 'lucide-react'
 import api from '../api'
 import { ROLES, roleMeta } from './networkRoles'
@@ -519,6 +519,14 @@ export default function NetworkDeviceDetail() {
       {(device.role === 'router' || device.role === 'l3-switch') && (
         <InterfaceSection id={id} />
       )}
+
+      {/* OSPF — same role-gating. Pure L2 switches don't run OSPF.
+          The section covers enabling a process, assigning interfaces
+          to it, optional network-type=point-to-point for /30 WAN
+          links, plus a read-only neighbor table. */}
+      {(device.role === 'router' || device.role === 'l3-switch') && (
+        <OSPFSection id={id} />
+      )}
     </div>
   )
 }
@@ -920,6 +928,353 @@ function InterfaceSection({ id }) {
                 <details className="mt-4 text-xs text-slate-400">
                   <summary className="cursor-pointer hover:text-slate-200">
                     Last change — <span className="text-slate-500">before / after <span className="font-mono">show run | section interface</span></span>
+                  </summary>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                    <div>
+                      <div className="text-[10px] font-semibold tracking-wider uppercase text-slate-500 mb-1">Before</div>
+                      <pre className="bg-canvas-900/60 border border-canvas-500 rounded p-2 overflow-x-auto text-[11px] text-slate-300 whitespace-pre">{lastDiff.before || '(empty)'}</pre>
+                    </div>
+                    <div>
+                      <div className="text-[10px] font-semibold tracking-wider uppercase text-slate-500 mb-1">After</div>
+                      <pre className="bg-canvas-900/60 border border-canvas-500 rounded p-2 overflow-x-auto text-[11px] text-slate-300 whitespace-pre">{lastDiff.after || '(empty)'}</pre>
+                    </div>
+                  </div>
+                </details>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── OSPF ────────────────────────────────────────────────────────
+//
+// Lazy-loaded bundle: processes + interfaces + neighbors from one
+// GET. Three sub-tables plus inline forms:
+//
+//  - Processes: add new (pid + router-id), delete.
+//  - Interfaces: inline edit to attach/detach + pick network type.
+//    Shows IOS state ("P2P", "DR", "LOOP", …) + neighbor count.
+//  - Neighbors: read-only observation of who we're peered with.
+function OSPFSection({ id }) {
+  const [state, setState] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState('')
+  const [open, setOpen] = useState(false)
+  const [addingProc, setAddingProc] = useState(false)
+  const [draftProc, setDraftProc] = useState({ pid: '', router_id: '' })
+  const [editingIface, setEditingIface] = useState(null) // iface name
+  const [draftIface, setDraftIface] = useState({ pid: '', area: '', network_type: '' })
+  const [busy, setBusy] = useState(null)  // `proc:N` | `proc-del:N` | `iface:name`
+  const [lastDiff, setLastDiff] = useState(null)
+
+  const load = async () => {
+    setLoading(true); setErr('')
+    try {
+      const r = await api.get(`/network-devices/${id}/ospf`)
+      setState(r.data)
+    } catch (e) {
+      setErr(e.response?.data?.error || 'Failed to load OSPF state')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const toggle = () => {
+    const next = !open
+    setOpen(next)
+    if (next && state === null && !loading) load()
+  }
+
+  const submitProc = async (e) => {
+    e.preventDefault()
+    setErr('')
+    const pid = parseInt(draftProc.pid, 10)
+    if (!pid || pid < 1 || pid > 65535) { setErr('PID must be 1-65535'); return }
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(draftProc.router_id)) { setErr('Router ID must be dotted-decimal IPv4'); return }
+    setBusy(`proc:${pid}`)
+    try {
+      const r = await api.post(`/network-devices/${id}/ospf/processes`, {
+        pid, router_id: draftProc.router_id,
+      })
+      setState(r.data.state)
+      setLastDiff({ before: r.data.config_before, after: r.data.config_after })
+      setAddingProc(false); setDraftProc({ pid: '', router_id: '' })
+    } catch (e) {
+      setErr(e.response?.data?.error || 'Upsert failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const deleteProc = async (proc) => {
+    if (!confirm(`Delete OSPF process ${proc.pid} (router-id ${proc.router_id || '—'})? Interface attachments for this process will also be removed.`)) return
+    setBusy(`proc-del:${proc.pid}`); setErr('')
+    try {
+      const r = await api.delete(`/network-devices/${id}/ospf/processes/${proc.pid}`)
+      setState(r.data.state)
+      setLastDiff({ before: r.data.config_before, after: r.data.config_after })
+    } catch (e) {
+      alert(e.response?.data?.error || 'Delete failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const startEditIface = (iface) => {
+    setEditingIface(iface.name)
+    setDraftIface({
+      pid: iface.pid ? String(iface.pid) : '',
+      area: iface.area || '',
+      network_type: iface.network_type || '',
+    })
+    setErr('')
+  }
+
+  const cancelEditIface = () => {
+    setEditingIface(null); setDraftIface({ pid: '', area: '', network_type: '' }); setErr('')
+  }
+
+  const saveIface = async (iface) => {
+    const pid = draftIface.pid === '' ? 0 : parseInt(draftIface.pid, 10)
+    if (isNaN(pid) || pid < 0 || pid > 65535) { setErr('PID must be 0 (clear) or 1-65535'); return }
+    if (pid > 0 && !draftIface.area) { setErr('Area is required when PID > 0'); return }
+    setBusy(`iface:${iface.name}`)
+    try {
+      const r = await api.post(`/network-devices/${id}/ospf/interface`, {
+        name: iface.name, pid, area: draftIface.area, network_type: draftIface.network_type,
+      })
+      setState(r.data.state)
+      setLastDiff({ before: r.data.config_before, after: r.data.config_after })
+      setEditingIface(null); setDraftIface({ pid: '', area: '', network_type: '' })
+    } catch (e) {
+      setErr(e.response?.data?.error || 'Update failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const Chevron = open ? ChevronDown : ChevronRight
+
+  return (
+    <div className="bg-canvas-800 border border-canvas-500 rounded-xl overflow-hidden">
+      <button
+        onClick={toggle}
+        className="w-full px-5 py-3 border-b border-canvas-500 flex items-center gap-2 hover:bg-canvas-700/50 transition-colors text-left"
+      >
+        <Chevron size={14} className="text-slate-500 flex-shrink-0" />
+        <Share2 size={13} className="text-brand-400 flex-shrink-0" />
+        <h3 className="text-slate-300 text-xs font-semibold tracking-wider uppercase flex-shrink-0">OSPF</h3>
+        <span className="text-slate-500 text-xs truncate">· processes, interfaces, neighbors (runs <span className="font-mono">wr mem</span>)</span>
+        {open && (
+          <span
+            role="button"
+            tabIndex={0}
+            onClick={(e) => { e.stopPropagation(); load() }}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); load() } }}
+            className="ml-auto flex items-center gap-1 text-slate-500 hover:text-brand-300 text-[11px] cursor-pointer"
+          >
+            <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
+            {loading ? 'Loading…' : 'Reload'}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div className="px-5 py-4">
+          {loading && !state && <div className="text-slate-500 text-sm py-6 text-center">Loading…</div>}
+          {err && (
+            <div className="bg-red-900/20 border border-red-900/40 text-red-300 text-xs rounded-lg px-3 py-2 mb-3 font-mono break-all">{err}</div>
+          )}
+
+          {state && (
+            <>
+              {/* Processes */}
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-[10px] text-slate-500 tracking-wider uppercase">
+                  {state.processes?.length || 0} process{(state.processes?.length || 0) === 1 ? '' : 'es'}
+                </div>
+                {!addingProc && (
+                  <button
+                    onClick={() => { setAddingProc(true); setErr('') }}
+                    className="flex items-center gap-1.5 px-3 py-1 rounded border text-xs font-semibold bg-brand-500 hover:bg-brand-400 text-canvas-900 border-transparent transition-colors"
+                  >
+                    <Plus size={12} /> Add process
+                  </button>
+                )}
+              </div>
+
+              {addingProc && (
+                <form onSubmit={submitProc} className="bg-canvas-900/40 border border-brand-500/40 rounded-lg px-4 py-3 mb-4 flex items-end gap-3 flex-wrap">
+                  <div>
+                    <label className="block text-[10px] font-semibold tracking-wider uppercase text-slate-400 mb-1">Process ID</label>
+                    <input
+                      type="number" min="1" max="65535" required
+                      value={draftProc.pid}
+                      onChange={e => setDraftProc(p => ({ ...p, pid: e.target.value }))}
+                      className="w-24 bg-canvas-900 border border-canvas-500 focus:border-brand-500 text-slate-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none"
+                      placeholder="1"
+                    />
+                  </div>
+                  <div className="flex-1 min-w-[180px]">
+                    <label className="block text-[10px] font-semibold tracking-wider uppercase text-slate-400 mb-1">Router ID</label>
+                    <input
+                      type="text" required
+                      value={draftProc.router_id}
+                      onChange={e => setDraftProc(p => ({ ...p, router_id: e.target.value }))}
+                      className="w-full bg-canvas-900 border border-canvas-500 focus:border-brand-500 text-slate-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none"
+                      placeholder="e.g. 1.1.1.1"
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button type="button" onClick={() => { setAddingProc(false); setErr('') }}
+                            className="px-3 py-1.5 rounded text-slate-400 hover:text-slate-200 text-xs">Cancel</button>
+                    <button type="submit" disabled={busy !== null}
+                            className="flex items-center gap-1.5 bg-brand-500 hover:bg-brand-400 disabled:opacity-50 text-canvas-900 font-semibold px-3 py-1.5 rounded text-xs">
+                      {busy?.startsWith('proc:') ? <RefreshCw size={11} className="animate-spin" /> : <Plus size={11} />}
+                      Save
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              <SubTable
+                icon={Share2}
+                title="Processes"
+                count={state.processes?.length || 0}
+                error={state.processes_error}
+                rows={state.processes || []}
+                cols={[
+                  { header: 'PID',       render: p => <span className="font-mono text-slate-400">{p.pid}</span> },
+                  { header: 'Router ID', render: p => p.router_id ? <span className="font-mono text-[11px]">{p.router_id}</span> : null },
+                  { header: 'Areas',     render: p => p.areas?.length ? (
+                      <span className="font-mono text-[11px] text-slate-400">{p.areas.join(', ')}</span>
+                    ) : <span className="text-slate-600 text-[11px] italic">no interfaces</span> },
+                  { header: '', render: p => (
+                      <button
+                        onClick={() => deleteProc(p)}
+                        disabled={busy !== null}
+                        className="flex items-center gap-1 px-2 py-0.5 rounded text-red-300 hover:bg-red-900/30 border border-red-700/30 text-[11px] disabled:opacity-50"
+                      >
+                        {busy === `proc-del:${p.pid}` ? <RefreshCw size={10} className="animate-spin" /> : <Trash2 size={10} />}
+                        Delete
+                      </button>
+                    ) },
+                ]}
+                empty="No OSPF processes configured"
+              />
+
+              {/* Interfaces in OSPF */}
+              <SubTable
+                icon={NetIcon}
+                title="Interfaces"
+                count={state.interfaces?.length || 0}
+                error={state.interfaces_error}
+                rows={state.interfaces || []}
+                cols={[
+                  { header: 'Name', render: r => <span className="font-mono text-slate-400">{r.name}</span> },
+                  { header: 'PID', render: r => editingIface === r.name ? (
+                      <input
+                        type="number" min="0" max="65535"
+                        value={draftIface.pid}
+                        onChange={e => setDraftIface(d => ({ ...d, pid: e.target.value }))}
+                        className="w-16 bg-canvas-900 border border-brand-500/60 text-slate-100 rounded px-2 py-0.5 text-[11px] font-mono focus:outline-none"
+                        placeholder="0=clear"
+                      />
+                    ) : <span className="font-mono text-[11px]">{r.pid}</span> },
+                  { header: 'Area', render: r => editingIface === r.name ? (
+                      <input
+                        type="text"
+                        value={draftIface.area}
+                        onChange={e => setDraftIface(d => ({ ...d, area: e.target.value }))}
+                        className="w-16 bg-canvas-900 border border-brand-500/60 text-slate-100 rounded px-2 py-0.5 text-[11px] font-mono focus:outline-none"
+                        placeholder="0"
+                      />
+                    ) : <span className="font-mono text-[11px]">{r.area}</span> },
+                  { header: 'IP',    render: r => r.ip_cidr && <span className="font-mono text-[11px]">{r.ip_cidr}</span> },
+                  { header: 'State', render: r => {
+                      const s = r.state
+                      const cls = s === 'P2P' ? 'bg-cyan-500/10 text-cyan-300 ring-cyan-500/30'
+                                : s === 'DR' ? 'bg-lime-500/10 text-lime-300 ring-lime-500/30'
+                                : s === 'BDR' ? 'bg-amber-500/10 text-amber-300 ring-amber-500/30'
+                                : s === 'LOOP' ? 'bg-slate-500/10 text-slate-400 ring-slate-500/30'
+                                : 'bg-slate-500/10 text-slate-400 ring-slate-500/30'
+                      return s ? <span className={`inline-block px-1.5 py-0.5 rounded ${cls} ring-1 text-[10px] font-medium`}>{s}</span> : null
+                    } },
+                  { header: 'Nbrs F/C', render: r => r.neighbors_fc && <span className="font-mono text-[11px] text-slate-400">{r.neighbors_fc}</span> },
+                  { header: 'Net type', render: r => editingIface === r.name ? (
+                      <select
+                        value={draftIface.network_type}
+                        onChange={e => setDraftIface(d => ({ ...d, network_type: e.target.value }))}
+                        className="bg-canvas-900 border border-brand-500/60 text-slate-100 rounded px-2 py-0.5 text-[11px] font-mono focus:outline-none"
+                      >
+                        <option value="">(default)</option>
+                        <option value="point-to-point">point-to-point</option>
+                        <option value="point-to-multipoint">point-to-multipoint</option>
+                        <option value="broadcast">broadcast</option>
+                        <option value="non-broadcast">non-broadcast</option>
+                      </select>
+                    ) : (r.network_type && <span className="font-mono text-[11px] text-slate-400">{r.network_type}</span>) },
+                  { header: '', render: r => editingIface === r.name ? (
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => saveIface(r)}
+                          disabled={busy !== null}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded text-lime-300 hover:bg-lime-900/30 border border-lime-700/30 text-[11px] disabled:opacity-50"
+                        >
+                          {busy === `iface:${r.name}` ? <RefreshCw size={10} className="animate-spin" /> : <CheckIcon size={10} />}
+                          Save
+                        </button>
+                        <button
+                          onClick={cancelEditIface}
+                          disabled={busy !== null}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded text-slate-400 hover:bg-canvas-700 border border-canvas-500 text-[11px] disabled:opacity-50"
+                        >
+                          <XIcon size={10} /> Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => startEditIface(r)}
+                        disabled={busy !== null}
+                        className="flex items-center gap-1 px-2 py-0.5 rounded text-brand-300 hover:bg-brand-500/10 border border-brand-500/30 text-[11px] disabled:opacity-50"
+                      >
+                        <Pencil size={10} /> Edit
+                      </button>
+                    ) },
+                ]}
+                empty="No interfaces attached to any OSPF process"
+              />
+
+              {/* Neighbors — observation only */}
+              <SubTable
+                icon={Users}
+                title="Neighbors"
+                count={state.neighbors?.length || 0}
+                error={state.neighbors_error}
+                rows={state.neighbors || []}
+                cols={[
+                  { header: 'Neighbor ID', render: n => <span className="font-mono text-[11px]">{n.neighbor_id}</span> },
+                  { header: 'State', render: n => {
+                      const cls = n.state?.startsWith('FULL') ? 'bg-lime-500/10 text-lime-300 ring-lime-500/30'
+                                : n.state?.includes('2WAY') ? 'bg-amber-500/10 text-amber-300 ring-amber-500/30'
+                                : 'bg-slate-500/10 text-slate-400 ring-slate-500/30'
+                      return <span className={`inline-block px-1.5 py-0.5 rounded ${cls} ring-1 text-[10px] font-medium`}>{n.state}</span>
+                    } },
+                  { header: 'Address', render: n => <span className="font-mono text-[11px]">{n.address}</span> },
+                  { header: 'Interface', render: n => <span className="font-mono text-[11px] text-slate-400">{n.interface}</span> },
+                  { header: 'Dead Time', render: n => <span className="font-mono text-[11px] text-slate-500">{n.dead_time}</span> },
+                  { header: 'Pri', render: n => <span className="text-[11px] text-slate-500">{n.priority}</span> },
+                ]}
+                empty="No neighbors detected (or OSPF not configured yet)"
+              />
+
+              {lastDiff && (
+                <details className="mt-4 text-xs text-slate-400">
+                  <summary className="cursor-pointer hover:text-slate-200">
+                    Last change — <span className="text-slate-500">before / after config snapshot</span>
                   </summary>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
                     <div>

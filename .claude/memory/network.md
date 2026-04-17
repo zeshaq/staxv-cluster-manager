@@ -21,6 +21,10 @@ gated to role ∈ {switch, l3-switch}.
 **Phase 3 shipped.** Interface IP management — list, set, clear.
 UI gated to role ∈ {router, l3-switch}.
 
+**Phase 4 shipped.** OSPF — process CRUD, per-interface attach with
+optional `network point-to-point` for /30 WAN links, read-only
+neighbor table. UI gated to role ∈ {router, l3-switch}.
+
 ## Scope (shipped)
 
 ### CRUD + reachability
@@ -125,6 +129,45 @@ field carries both host + mask, which the backend splits into IOS's
 **Config-mode reuse** — `RunConfigLines` + `ShowRunningConfig(section)` from Phase 2's config.go handle the low-level plumbing. Phase 3 just wires them to interface-specific commands.
 
 **Role-gated UI** — `InterfaceSection` on the device detail page only renders when `device.role ∈ {router, l3-switch}`. Pure L2 access switches rarely have per-port IPs (they use a management SVI); surfacing this editor on them would be confusing. Admin can still do it via CLI. Inside the section: lazy-loaded table with inline-edit pencil button per row — click opens a CIDR input pre-filled with the current IP + `/24` default, Enter to save, Escape to cancel. Blank input + Save clears the IP. Collapsible "Last change" at the bottom reveals before/after `show run | section interface <name>` snapshots.
+
+### OSPF (Phase 4)
+
+Enough to stand up a small P2P mesh between lab routers without
+dropping to CLI: enable a process, assign interfaces, flip `network
+point-to-point` so /30 links form neighbors without DR/BDR
+election.
+
+- `GET    /api/network-devices/{id}/ospf` — returns `{processes[], interfaces[], neighbors[], *_error}`. Three independent queries; per-block errors surfaced so a partial failure still shows useful data.
+- `POST   /api/network-devices/{id}/ospf/processes` body `{pid, router_id}` — idempotent upsert. `router ospf N / router-id X.X.X.X / end / wr mem`.
+- `DELETE /api/network-devices/{id}/ospf/processes/{pid}` — `no router ospf N`. IOS auto-removes interface attachments for this pid.
+- `POST   /api/network-devices/{id}/ospf/interface` body `{name, pid, area, network_type}` — full-state set. `pid=0` clears. The backend reads the current per-interface running-config first so it knows which `(pid, area)` to `no ip ospf` when transitioning, then emits the new `ip ospf N area A` + optional `ip ospf network <type>`.
+
+**OSPF-layer** in `pkg/cisco/ospf.go`:
+- Types: `OSPFProcess {pid, router_id, areas[]}`, `OSPFInterface {name, pid, area, ip_cidr, cost, state, neighbors_fc, network_type}`, `OSPFNeighbor {neighbor_id, priority, state, dead_time, address, interface}`. Bundled via `OSPFState`.
+- `GetOSPFState()` runs `show running-config | section ^router ospf` (structured — beats parsing `show ip ospf`'s variable format) + `show ip ospf interface brief` + `show ip ospf neighbor`. Areas per process are derived from the interface attachments table.
+- `CreateOrUpdateOSPFProcess(pid, routerID)` / `DeleteOSPFProcess(pid)` / `SetOSPFInterface(name, pid, area, networkType)` — each returns (before, after, err) snapshots.
+- `parseInterfaceOSPFFromConfig` extracts `(pid, area, network_type)` from a per-interface running-config block so we know the current state before a transition.
+- `validateRouterID` requires dotted-decimal IPv4.
+- `OSPFNetworkTypes` — allow-list map: `point-to-point` | `point-to-multipoint` | `broadcast` | `non-broadcast` | `""` (= don't touch).
+
+**Transition logic** in `SetOSPFInterface` (the tricky bit):
+
+| Current | Desired | Commands sent |
+|---|---|---|
+| no OSPF | `pid=1, area=0` | `ip ospf 1 area 0` |
+| no OSPF | `pid=1, area=0, p2p` | `ip ospf 1 area 0` + `ip ospf network point-to-point` |
+| `pid=1, area=0` | `pid=0` (clear) | `no ip ospf 1 area 0` |
+| `pid=1, area=0, p2p` | `pid=0` | `no ip ospf 1 area 0` + `no ip ospf network` |
+| `pid=1, area=0` | `pid=1, area=5` | `no ip ospf 1 area 0` + `ip ospf 1 area 5` |
+| `pid=1, area=0` | `pid=2, area=0` | `no ip ospf 1 area 0` + `ip ospf 2 area 0` |
+
+**Role-gated UI** — `OSPFSection` on device detail, renders only when `device.role ∈ {router, l3-switch}`. Three sub-tables (Processes / Interfaces / Neighbors) plus:
+- Add-process form (inline, PID + Router ID validation mirroring backend).
+- Per-interface inline edit (PID / Area / network-type dropdown). Non-attached interfaces appear with PID=0 and are editable to attach.
+- Neighbor states colored by progress: green for FULL/*, amber for 2WAY, gray for DOWN/INIT.
+- "Last change" collapsible with before/after config snapshots from the response.
+
+**Scope (deferred within OSPF)** — cost / hello-interval / dead-interval / priority / passive-interface / authentication / stub-area / virtual-links / LSDB viewer. Per-interface cost is a one-line addition if / when needed; the auth + area-level stuff is more substantial.
 
 ### Offline bulk enrollment (CLI)
 
