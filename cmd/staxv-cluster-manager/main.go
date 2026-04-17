@@ -158,6 +158,7 @@ func cmdServe(args []string) {
 		os.Exit(1)
 	}
 	settingsStore := db.NewSettingsStore(store, aead)
+	serverStore := db.NewServerStore(store, aead)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -182,6 +183,12 @@ func cmdServe(args []string) {
 	// healthy as the control plane?"
 	dashH := handlers.NewDashboardHandler()
 	dashH.Mount(r, authMW)
+
+	// Physical servers — Redfish (iLO/iDRAC) inventory. Admin-only.
+	// Enrollment probes the BMC and stamps reachability immediately
+	// so the UI shows status right after form submit.
+	serversH := handlers.NewServersHandler(serverStore)
+	serversH.Mount(r, authMW)
 
 	// Web UI — React app embedded via embed.FS. Empty on fresh clone
 	// (placeholder until `make frontend` runs).

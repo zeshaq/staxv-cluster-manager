@@ -2,14 +2,19 @@ import { Link, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
 import {
   LayoutDashboard, Server, Users, Settings as SettingsIcon,
-  LogOut, Activity,
+  LogOut, Activity, HardDrive,
 } from 'lucide-react'
 import api from '../api'
 
 // Sidebar nav — one entry per top-level page. Icons from lucide-react.
 // Group commentary inline so "why this icon" doesn't drift from the UI.
+//
+// Order reflects the infrastructure layering: physical boxes (Servers,
+// bare metal via Redfish) → hypervisors running on them (Fleet) →
+// identity + tooling (Users, Settings).
 const NAV = [
   { to: '/',         label: 'Overview', icon: LayoutDashboard }, // cluster-wide snapshot
+  { to: '/servers',  label: 'Servers',  icon: HardDrive },       // physical servers (iLO / iDRAC)
   { to: '/fleet',    label: 'Fleet',    icon: Server },           // enrolled hypervisors
   { to: '/users',    label: 'Users',    icon: Users },            // fleet-level user directory
   { to: '/settings', label: 'Settings', icon: SettingsIcon },     // per-user + system settings

@@ -98,14 +98,14 @@ export default function Home() {
         </div>
       </div>
 
-      {/* ───────────── Fleet snapshot ───────────── */}
+      {/* ───────────── Infrastructure snapshot ───────────── */}
       <div>
-        <SectionHeader title="Fleet" sub="Aggregated across all enrolled hypervisors." linkTo="/fleet" linkLabel="Manage fleet" />
+        <SectionHeader title="Infrastructure" sub="Physical inventory and logical hypervisor fleet." />
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <StatCard icon={Server}   label="Hypervisors" value={fleet.nodes}    sub="Enrolled nodes"         accent="brand" />
-          <StatCard icon={Cpu}      label="VMs"         value={fleet.vms}      sub="Across all hypervisors" accent="lime" />
-          <StatCard icon={Network}  label="Clusters"    value={fleet.clusters} sub="Migration-capable groups" accent="slate" />
-          <StatCard icon={Activity} label="Health"      value="—"              sub="No nodes enrolled yet"  accent="slate" />
+          <StatCard icon={HardDrive} label="Physical Servers" value={0}              sub="Via iLO / iDRAC"        accent="brand" />
+          <StatCard icon={Server}    label="Hypervisors"      value={fleet.nodes}    sub="Enrolled nodes"         accent="brand" />
+          <StatCard icon={Cpu}       label="VMs"              value={fleet.vms}      sub="Across all hypervisors" accent="lime" />
+          <StatCard icon={Network}   label="Clusters"         value={fleet.clusters} sub="Migration-capable groups" accent="slate" />
         </div>
         {fleet.nodes === 0 && (
           <div className="mt-4 bg-canvas-800 border border-dashed border-canvas-500 rounded-xl p-5 flex items-center justify-between flex-wrap gap-3">
