@@ -23,6 +23,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -65,17 +66,21 @@ func New(host string, port int, username, password string) *Client {
 
 // serviceRoot is the tiniest subset of the Redfish root document we
 // need — just enough to confirm the endpoint really is Redfish and to
-// follow the Systems collection link.
+// follow the Systems / Chassis collection links.
 type serviceRoot struct {
 	RedfishVersion string `json:"RedfishVersion"`
 	Systems        odata  `json:"Systems"`
+	Chassis        odata  `json:"Chassis"`
 }
 
 type odata struct {
 	ID string `json:"@odata.id"`
 }
 
-type systemsCollection struct {
+// collection is any Redfish collection — Systems, Chassis, Processors,
+// Memory, Drives, EthernetInterfaces all share this shape. Individual
+// members are additional GETs.
+type collection struct {
 	Members []odata `json:"Members"`
 }
 
@@ -136,34 +141,20 @@ type SystemInfo struct {
 // Network / TLS / timeout failures surface as their own error types
 // so the caller can set status="unreachable" vs "error" appropriately.
 func (c *Client) Probe(ctx context.Context) (*SystemInfo, error) {
-	var root serviceRoot
-	if err := c.getJSON(ctx, c.baseURL.String(), &root); err != nil {
-		return nil, fmt.Errorf("service root: %w", err)
-	}
-	if root.RedfishVersion == "" && root.Systems.ID == "" {
-		// Valid 200 but doesn't smell like Redfish. Rare — happens
-		// with proxies or mis-pointed URLs.
-		return nil, errors.New("endpoint returned 200 but doesn't appear to be a Redfish service")
-	}
-
-	// Systems collection URL — relative to host root, NOT the /redfish/v1/
-	// base. Redfish returns paths like "/redfish/v1/Systems".
+	systemURL, err := c.firstSystemURL(ctx)
 	info := &SystemInfo{}
-	if root.Systems.ID == "" {
-		return info, nil // alive but no systems list — weirdly empty but not an error
+	if err != nil {
+		// Distinguish "empty-but-alive" (nil URL, nil err) from real
+		// failures. The helper returns "" + nil when the root is alive
+		// but has no Systems — a weird BMC but not our error to own.
+		return info, err
 	}
-	var coll systemsCollection
-	if err := c.getJSON(ctx, c.absURL(root.Systems.ID), &coll); err != nil {
-		// Root worked; collection failed — return what we have as a
-		// partial success rather than dropping reachability entirely.
-		return info, fmt.Errorf("systems collection: %w", err)
-	}
-	if len(coll.Members) == 0 {
+	if systemURL == "" {
 		return info, nil
 	}
 
 	var sys computerSystem
-	if err := c.getJSON(ctx, c.absURL(coll.Members[0].ID), &sys); err != nil {
+	if err := c.getJSON(ctx, c.absURL(systemURL), &sys); err != nil {
 		return info, fmt.Errorf("computer system: %w", err)
 	}
 	info.Manufacturer = sys.Manufacturer
@@ -192,6 +183,66 @@ func (c *Client) absURL(path string) string {
 	u := *c.baseURL
 	u.Path = path
 	return u.String()
+}
+
+// firstSystemURL walks service-root → Systems collection → first member
+// and returns the member's Redfish path (e.g. "/redfish/v1/Systems/1").
+//
+// Returns ("", nil) for the "BMC is alive but has no systems listed"
+// edge case — rare, but honest to caller. Returns ("", err) for
+// network/auth/HTTP failures, each wrapped in typed errors so the
+// caller's errors.As works.
+//
+// Shared by Probe(), PowerAction(), and the hardware-inventory methods
+// in hardware.go. Each pays the ~2 GETs every call — cheap compared to
+// the subsequent collection fetches, not worth caching across calls.
+func (c *Client) firstSystemURL(ctx context.Context) (string, error) {
+	var root serviceRoot
+	if err := c.getJSON(ctx, c.baseURL.String(), &root); err != nil {
+		return "", fmt.Errorf("service root: %w", err)
+	}
+	if root.RedfishVersion == "" && root.Systems.ID == "" {
+		return "", errors.New("endpoint returned 200 but doesn't appear to be a Redfish service")
+	}
+	if root.Systems.ID == "" {
+		return "", nil // alive but empty — caller decides whether that's an error
+	}
+	var coll collection
+	if err := c.getJSON(ctx, c.absURL(root.Systems.ID), &coll); err != nil {
+		return "", fmt.Errorf("systems collection: %w", err)
+	}
+	if len(coll.Members) == 0 {
+		return "", nil
+	}
+	// Some BMCs (HPE iLO5/iLO6) serve @odata.id with a trailing slash;
+	// others (Dell iDRAC) don't. Normalize so callers can safely append
+	// sub-paths like "/Processors" without producing "//".
+	return strings.TrimRight(coll.Members[0].ID, "/"), nil
+}
+
+// firstChassisURL is the Chassis-side analog of firstSystemURL.
+// Thermal / Power resources live under the Chassis, not the System —
+// they represent physical hardware (fans, PSUs) rather than the logical
+// compute unit.
+//
+// Same semantics: ("", nil) for "alive but no chassis", ("", err) for
+// real failures.
+func (c *Client) firstChassisURL(ctx context.Context) (string, error) {
+	var root serviceRoot
+	if err := c.getJSON(ctx, c.baseURL.String(), &root); err != nil {
+		return "", fmt.Errorf("service root: %w", err)
+	}
+	if root.Chassis.ID == "" {
+		return "", nil
+	}
+	var coll collection
+	if err := c.getJSON(ctx, c.absURL(root.Chassis.ID), &coll); err != nil {
+		return "", fmt.Errorf("chassis collection: %w", err)
+	}
+	if len(coll.Members) == 0 {
+		return "", nil
+	}
+	return strings.TrimRight(coll.Members[0].ID, "/"), nil
 }
 
 // getJSON fetches + decodes a JSON resource with basic auth and the
@@ -293,22 +344,13 @@ func (c *Client) PowerAction(ctx context.Context, resetType string) error {
 		return errors.New("redfish: empty reset type")
 	}
 
-	// Walk to the System resource (reuses the same path as Probe).
-	var root serviceRoot
-	if err := c.getJSON(ctx, c.baseURL.String(), &root); err != nil {
-		return fmt.Errorf("service root: %w", err)
+	systemURL, err := c.firstSystemURL(ctx)
+	if err != nil {
+		return err
 	}
-	if root.Systems.ID == "" {
-		return errors.New("redfish: no Systems collection on this BMC")
+	if systemURL == "" {
+		return errors.New("redfish: no ComputerSystem on this BMC")
 	}
-	var coll systemsCollection
-	if err := c.getJSON(ctx, c.absURL(root.Systems.ID), &coll); err != nil {
-		return fmt.Errorf("systems collection: %w", err)
-	}
-	if len(coll.Members) == 0 {
-		return errors.New("redfish: Systems collection is empty")
-	}
-	systemURL := coll.Members[0].ID
 
 	// Read the system's Actions block. We only need the Reset action
 	// target + allowed values, so keep the struct tight.

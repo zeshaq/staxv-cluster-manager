@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/zeshaq/staxv-cluster-manager/internal/db"
@@ -42,6 +43,8 @@ func (h *ServersHandler) Mount(r chi.Router, authMW func(http.Handler) http.Hand
 		r.Delete("/{id}", h.Delete)
 		r.Post("/{id}/test", h.Test)
 		r.Post("/{id}/power", h.Power)
+		r.Get("/{id}/hardware", h.Hardware)
+		r.Get("/{id}/health", h.Health)
 	})
 }
 
@@ -331,6 +334,144 @@ func (h *ServersHandler) probe(ctx context.Context, _id int64, host string, port
 	// A partial success (info populated but err set) falls through as
 	// OK=false Status="error" — conservative default.
 	return r
+}
+
+// Hardware returns the full hardware-inventory drill-down for one
+// server — CPUs, DIMMs, drives, NICs. Each collection is fetched in
+// parallel; per-collection errors are surfaced inside the JSON so a
+// BMC that exposes some collections but not others still yields a
+// useful response instead of an all-or-nothing 500.
+//
+// First-time cost on a populous box (2 sockets, 24 DIMMs, 6 drives,
+// 4 NICs) is ~2s against a warm BMC; 5-10s on cold iLO. UI lazy-loads
+// on expand so initial paint stays fast.
+func (h *ServersHandler) Hardware(w http.ResponseWriter, r *http.Request) {
+	cli, srvName, ok := h.clientForServer(w, r)
+	if !ok {
+		return
+	}
+
+	// Four independent collections. Run them concurrently — each one
+	// makes its own firstSystemURL call, so there's 4× the service-root
+	// GET traffic, but those are cheap and the BMC TCP pool reuses
+	// connections. Saves ~4-8s of wall time vs. serial.
+	var (
+		hw redfish.Hardware
+		wg sync.WaitGroup
+	)
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		procs, err := cli.Processors(r.Context())
+		hw.Processors = procs
+		if err != nil {
+			hw.ProcessorsErr = err.Error()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		mem, err := cli.Memory(r.Context())
+		hw.Memory = mem
+		if err != nil {
+			hw.MemoryErr = err.Error()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		drives, err := cli.Drives(r.Context())
+		hw.Drives = drives
+		if err != nil {
+			hw.DrivesErr = err.Error()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		nics, err := cli.NetworkInterfaces(r.Context())
+		hw.NICs = nics
+		if err != nil {
+			hw.NICsErr = err.Error()
+		}
+	}()
+	wg.Wait()
+
+	slog.Info("server hardware fetched",
+		"name", srvName,
+		"cpus", len(hw.Processors),
+		"dimms", len(hw.Memory),
+		"drives", len(hw.Drives),
+		"nics", len(hw.NICs),
+	)
+	writeJSON(w, http.StatusOK, hw)
+}
+
+// Health returns thermal + power sensor readings. Two independent GETs
+// (chassis-level /Thermal and /Power), run in parallel. Same per-block
+// error convention as Hardware.
+func (h *ServersHandler) Health(w http.ResponseWriter, r *http.Request) {
+	cli, srvName, ok := h.clientForServer(w, r)
+	if !ok {
+		return
+	}
+
+	var (
+		out redfish.Health
+		wg  sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		fans, temps, err := cli.Thermal(r.Context())
+		out.Fans = fans
+		out.Temperatures = temps
+		if err != nil {
+			out.ThermalErr = err.Error()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		psus, consumption, err := cli.Power(r.Context())
+		out.PSUs = psus
+		out.Power = consumption
+		if err != nil {
+			out.PowerErr = err.Error()
+		}
+	}()
+	wg.Wait()
+
+	slog.Info("server health fetched",
+		"name", srvName,
+		"fans", len(out.Fans),
+		"temps", len(out.Temperatures),
+		"psus", len(out.PSUs),
+		"watts", out.Power.ConsumedWatts,
+	)
+	writeJSON(w, http.StatusOK, out)
+}
+
+// clientForServer is the shared "fetch row + creds → redfish.Client"
+// helper used by Hardware/Health. Writes the HTTP response on failure
+// and returns ok=false so the caller returns immediately.
+func (h *ServersHandler) clientForServer(w http.ResponseWriter, r *http.Request) (cli *redfish.Client, name string, ok bool) {
+	id, okID := parseInt64Param(w, r, "id")
+	if !okID {
+		return nil, "", false
+	}
+	srv, err := h.store.GetServer(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, "not found", http.StatusNotFound)
+			return nil, "", false
+		}
+		writeError(w, "lookup failed", http.StatusInternalServerError)
+		return nil, "", false
+	}
+	username, password, err := h.store.GetCredentials(r.Context(), id)
+	if err != nil {
+		slog.Error("inventory: decrypt creds", "err", err, "id", id)
+		writeError(w, "credentials unavailable", http.StatusInternalServerError)
+		return nil, "", false
+	}
+	return redfish.New(srv.BMCHost, srv.BMCPort, username, password), srv.Name, true
 }
 
 func truncateErr(err error, max int) string {

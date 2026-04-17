@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import {
-  ChevronLeft, HardDrive, RefreshCw, Trash2, CheckCircle, XCircle,
+  ChevronLeft, ChevronDown, ChevronRight,
+  HardDrive, RefreshCw, Trash2, CheckCircle, XCircle,
   AlertTriangle, HelpCircle, Cpu, MemoryStick, Tag, Network,
   Power, PowerOff, RotateCw, Zap, Thermometer, Key, Play, Square,
+  Fan, Wind, Gauge, CircuitBoard,
 } from 'lucide-react'
 import api from '../api'
 
@@ -130,6 +132,151 @@ function Section({ icon: Icon, title, children }) {
       <div className="px-5 py-1">{children}</div>
     </div>
   )
+}
+
+// Expandable variant of Section. Lazy-loads children on first expand
+// so a collapsed section has zero cost. Caches content while the page
+// is open — clicking collapse/expand doesn't refetch. A manual reload
+// button in the header re-triggers load.
+//
+// `load` is an async function that returns the data or throws; we
+// catch into local state and render `render(data, err)` below.
+function ExpandableSection({ icon: Icon, title, subtitle, load, render, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen)
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState('')
+
+  const doLoad = async () => {
+    setLoading(true); setErr('')
+    try {
+      setData(await load())
+    } catch (e) {
+      setErr(e.response?.data?.error || e.message || 'Load failed')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const toggle = () => {
+    const next = !open
+    setOpen(next)
+    // Lazy-load on first expand only. `data === null` means "never loaded" —
+    // `[]` or `{}` are valid empty responses we keep cached.
+    if (next && data === null && !loading) doLoad()
+  }
+
+  const Chevron = open ? ChevronDown : ChevronRight
+
+  return (
+    <div className="bg-canvas-800 border border-canvas-500 rounded-xl overflow-hidden">
+      <button
+        onClick={toggle}
+        className="w-full px-5 py-3 border-b border-canvas-500 flex items-center gap-2 hover:bg-canvas-700/50 transition-colors text-left"
+      >
+        <Chevron size={14} className="text-slate-500 flex-shrink-0" />
+        {Icon && <Icon size={13} className="text-brand-400 flex-shrink-0" />}
+        <h3 className="text-slate-300 text-xs font-semibold tracking-wider uppercase flex-shrink-0">{title}</h3>
+        {subtitle && <span className="text-slate-500 text-xs truncate">· {subtitle}</span>}
+        {open && (
+          <span
+            role="button"
+            tabIndex={0}
+            onClick={(e) => { e.stopPropagation(); doLoad() }}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); doLoad() } }}
+            className="ml-auto flex items-center gap-1 text-slate-500 hover:text-brand-300 text-[11px] cursor-pointer"
+            title="Reload"
+          >
+            <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
+            {loading ? 'Loading…' : 'Reload'}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="px-5 py-4">
+          {loading && !data && (
+            <div className="text-slate-500 text-sm py-6 text-center">Loading…</div>
+          )}
+          {err && (
+            <div className="bg-red-900/20 border border-red-900/40 text-red-300 text-xs rounded-lg px-3 py-2 mb-3 font-mono break-all">{err}</div>
+          )}
+          {data && render(data)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// SubTable: a compact per-subsection table with header + rows. Shared by
+// Hardware and Health blocks so they look consistent. `cols` is an
+// array of { header, render(row) }.
+function SubTable({ icon: Icon, title, count, error, rows, cols, empty = 'None reported' }) {
+  return (
+    <div className="mb-5 last:mb-0">
+      <div className="flex items-baseline gap-2 mb-2">
+        {Icon && <Icon size={12} className="text-brand-400" />}
+        <h4 className="text-slate-300 text-xs font-semibold tracking-wider uppercase">{title}</h4>
+        <span className="text-slate-500 text-xs">{count}</span>
+      </div>
+      {error && (
+        <div className="bg-red-900/20 border border-red-900/40 text-red-300/90 text-[11px] rounded px-2 py-1 mb-2 font-mono break-all">{error}</div>
+      )}
+      {!rows || rows.length === 0 ? (
+        <div className="text-slate-600 text-xs italic py-2">{empty}</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-left text-slate-500 border-b border-canvas-500">
+                {cols.map((c, i) => (
+                  <th key={i} className="font-medium uppercase tracking-wider py-1.5 pr-4 whitespace-nowrap">{c.header}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, i) => (
+                <tr key={i} className="border-b border-canvas-600/50 last:border-0 text-slate-300">
+                  {cols.map((c, j) => (
+                    <td key={j} className="py-1.5 pr-4 align-top">{c.render(row) ?? <span className="text-slate-600">—</span>}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Small health pill for per-component Status.Health coloring.
+function Pip({ value }) {
+  if (!value) return <span className="text-slate-600">—</span>
+  const c = {
+    OK:       'bg-lime-500/10 text-lime-300 ring-lime-500/30',
+    Warning:  'bg-amber-500/10 text-amber-300 ring-amber-500/30',
+    Critical: 'bg-red-500/10 text-red-300 ring-red-500/30',
+  }[value] || 'bg-slate-500/10 text-slate-400 ring-slate-500/30'
+  return (
+    <span className={`inline-block px-1.5 py-0.5 rounded ${c} ring-1 text-[10px] font-medium`}>{value}</span>
+  )
+}
+
+// Format bytes as a short human string (2 decimals). Redfish returns
+// exact byte counts; 1.92 TB is more readable than 1920383410176.
+function fmtBytes(n) {
+  if (!n) return null
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+  let v = n, u = 0
+  while (v >= 1000 && u < units.length - 1) { v /= 1000; u++ }
+  return `${v.toFixed(v < 10 && u > 0 ? 2 : v < 100 ? 1 : 0)} ${units[u]}`
+}
+
+// MiB → human. DIMMs report capacity in MiB (8192 = 8 GiB).
+function fmtMiB(mib) {
+  if (!mib) return null
+  if (mib >= 1024) return `${(mib / 1024).toFixed(mib % 1024 === 0 ? 0 : 1)} GiB`
+  return `${mib} MiB`
 }
 
 export default function ServerDetail() {
@@ -338,6 +485,181 @@ export default function ServerDetail() {
           Graceful actions ask the guest OS via ACPI. Force actions are immediate and can corrupt dirty filesystems — use only when the OS is unresponsive.
         </p>
       </Section>
+
+      {/* Hardware inventory — CPUs, DIMMs, Drives, NICs.
+          Lazy-loaded: first expand fires a single GET that fans out to
+          four Redfish collections in parallel on the backend. 2-5s on
+          a warm BMC, 5-10s cold. */}
+      <ExpandableSection
+        icon={CircuitBoard}
+        title="Hardware inventory"
+        subtitle="Processors, memory, drives, NICs"
+        load={() => api.get(`/servers/${id}/hardware`).then(r => r.data)}
+        render={(hw) => (
+          <>
+            <SubTable
+              icon={Cpu}
+              title="Processors"
+              count={hw.processors?.length || 0}
+              error={hw.processors_error}
+              rows={hw.processors}
+              cols={[
+                { header: 'Socket', render: r => <span className="font-mono text-slate-400">{r.id || r.name}</span> },
+                { header: 'Model', render: r => r.model || r.name },
+                { header: 'Cores / Threads', render: r => r.total_cores ? `${r.total_cores} / ${r.total_threads || '—'}` : null },
+                { header: 'Max speed', render: r => r.max_speed_mhz ? `${(r.max_speed_mhz/1000).toFixed(1)} GHz` : null },
+                { header: 'ISA', render: r => r.instruction_set },
+                { header: 'Health', render: r => <Pip value={r.health} /> },
+              ]}
+            />
+            <SubTable
+              icon={MemoryStick}
+              title="Memory"
+              count={(hw.memory?.filter(d => d.capacity_mib > 0).length) || 0}
+              error={hw.memory_error}
+              rows={hw.memory?.filter(d => d.capacity_mib > 0)}
+              cols={[
+                { header: 'Slot', render: r => <span className="font-mono text-slate-400">{r.name || r.id}</span> },
+                { header: 'Capacity', render: r => fmtMiB(r.capacity_mib) },
+                { header: 'Type', render: r => r.memory_device_type },
+                { header: 'Speed', render: r => r.operating_speed_mhz ? `${r.operating_speed_mhz} MHz` : null },
+                { header: 'Manufacturer', render: r => r.manufacturer },
+                { header: 'Part #', render: r => r.part_number && <span className="font-mono text-[11px]">{r.part_number}</span> },
+                { header: 'Health', render: r => <Pip value={r.health} /> },
+              ]}
+              empty="No populated DIMMs reported"
+            />
+            <SubTable
+              icon={HardDrive}
+              title="Drives"
+              count={hw.drives?.length || 0}
+              error={hw.drives_error}
+              rows={hw.drives}
+              cols={[
+                { header: 'Drive', render: r => <span className="font-mono text-slate-400">{r.id || r.name}</span> },
+                { header: 'Model', render: r => r.model || r.name },
+                { header: 'Capacity', render: r => fmtBytes(r.capacity_bytes) },
+                { header: 'Media', render: r => r.media_type },
+                { header: 'Protocol', render: r => r.protocol },
+                { header: 'Controller', render: r => <span className="text-slate-500 text-[11px]">{r.controller}</span> },
+                { header: 'Health', render: r => <Pip value={r.health} /> },
+              ]}
+            />
+            <SubTable
+              icon={Network}
+              title="Network interfaces"
+              count={hw.nics?.length || 0}
+              error={hw.nics_error}
+              rows={hw.nics}
+              cols={[
+                { header: 'Port', render: r => <span className="font-mono text-slate-400">{r.id || r.name}</span> },
+                { header: 'MAC', render: r => r.mac_address && <span className="font-mono text-[11px]">{r.mac_address}</span> },
+                { header: 'Speed', render: r => r.speed_mbps ? `${r.speed_mbps >= 1000 ? (r.speed_mbps/1000)+' Gb/s' : r.speed_mbps+' Mb/s'}` : null },
+                { header: 'Link', render: r => {
+                    if (!r.link_status) return null
+                    const cls = r.link_status === 'LinkUp'
+                      ? 'bg-lime-500/10 text-lime-300 ring-lime-500/30'
+                      : 'bg-slate-500/10 text-slate-400 ring-slate-500/30'
+                    return <span className={`inline-block px-1.5 py-0.5 rounded ${cls} ring-1 text-[10px] font-medium`}>{r.link_status}</span>
+                  } },
+                { header: 'IPv4', render: r => r.ipv4?.length ? <span className="font-mono text-[11px]">{r.ipv4.join(', ')}</span> : null },
+                { header: 'Health', render: r => <Pip value={r.health} /> },
+              ]}
+            />
+          </>
+        )}
+      />
+
+      {/* Thermal & power — fans, temperature probes, PSUs, live
+          consumption. Chassis-level readings; lazy-loaded just like
+          Hardware. ~1-2s warm. */}
+      <ExpandableSection
+        icon={Gauge}
+        title="Thermal & power"
+        subtitle="Fans, temperatures, PSUs, consumption"
+        load={() => api.get(`/servers/${id}/health`).then(r => r.data)}
+        render={(h) => (
+          <>
+            {/* Consumption summary card — one of the most useful datapoints
+                for a datacenter admin. Shown above the detail tables. */}
+            {(h.power?.consumed_watts > 0 || h.psus?.length > 0) && (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+                <Stat label="Current draw" value={h.power?.consumed_watts ? `${h.power.consumed_watts} W` : null} tone="brand" />
+                <Stat label="Average" value={h.power?.average_consumed_watts ? `${h.power.average_consumed_watts} W` : null} />
+                <Stat label="Peak (window)" value={h.power?.max_consumed_watts ? `${h.power.max_consumed_watts} W` : null} />
+                <Stat label="Capacity" value={h.power?.capacity_watts ? `${h.power.capacity_watts} W` : null} />
+              </div>
+            )}
+            <SubTable
+              icon={Fan}
+              title="Fans"
+              count={h.fans?.length || 0}
+              error={h.thermal_error}
+              rows={h.fans}
+              cols={[
+                { header: 'Fan', render: r => r.name },
+                { header: 'Reading', render: r => r.reading ? `${r.reading} ${r.reading_units || ''}`.trim() : null },
+                { header: 'Health', render: r => <Pip value={r.health} /> },
+                { header: 'State', render: r => <span className="text-slate-500 text-[11px]">{r.state}</span> },
+              ]}
+            />
+            <SubTable
+              icon={Thermometer}
+              title="Temperatures"
+              count={h.temperatures?.length || 0}
+              error={h.thermal_error}
+              rows={h.temperatures}
+              cols={[
+                { header: 'Sensor', render: r => r.name },
+                { header: 'Reading', render: r => {
+                    if (r.reading_celsius == null) return null
+                    const warn = r.upper_warning_celsius && r.reading_celsius >= r.upper_warning_celsius
+                    const crit = r.upper_critical_celsius && r.reading_celsius >= r.upper_critical_celsius
+                    const cls = crit ? 'text-red-300 font-semibold'
+                              : warn ? 'text-amber-300 font-semibold'
+                              : 'text-slate-200'
+                    return <span className={cls}>{r.reading_celsius.toFixed(1)} °C</span>
+                  } },
+                { header: 'Warn at', render: r => r.upper_warning_celsius ? <span className="text-slate-500 text-[11px]">{r.upper_warning_celsius.toFixed(0)} °C</span> : null },
+                { header: 'Critical at', render: r => r.upper_critical_celsius ? <span className="text-slate-500 text-[11px]">{r.upper_critical_celsius.toFixed(0)} °C</span> : null },
+                { header: 'Health', render: r => <Pip value={r.health} /> },
+              ]}
+            />
+            <SubTable
+              icon={Wind}
+              title="Power supplies"
+              count={h.psus?.length || 0}
+              error={h.power_error}
+              rows={h.psus}
+              cols={[
+                { header: 'PSU', render: r => r.name },
+                { header: 'Capacity', render: r => r.power_capacity_watts ? `${r.power_capacity_watts} W` : null },
+                { header: 'Input', render: r => r.line_input_voltage ? `${r.line_input_voltage.toFixed(0)} V ${r.input_type || ''}`.trim() : r.input_type },
+                { header: 'Manufacturer', render: r => r.manufacturer },
+                { header: 'Model', render: r => r.model && <span className="font-mono text-[11px]">{r.model}</span> },
+                { header: 'Health', render: r => <Pip value={r.health} /> },
+              ]}
+            />
+          </>
+        )}
+      />
+    </div>
+  )
+}
+
+// Stat: big-number + small-label card for the power consumption summary.
+// Tiny enough to live at the bottom of the file rather than pulling
+// out to components/.
+function Stat({ label, value, tone }) {
+  const cls = tone === 'brand'
+    ? 'border-brand-500/30 bg-brand-500/5'
+    : 'border-canvas-500 bg-canvas-900/40'
+  return (
+    <div className={`rounded-lg border px-4 py-3 ${cls}`}>
+      <div className="text-slate-500 text-[10px] font-semibold tracking-wider uppercase mb-0.5">{label}</div>
+      <div className={`text-xl font-semibold ${tone === 'brand' ? 'text-brand-300' : 'text-slate-200'}`}>
+        {value || <span className="text-slate-600 text-base">—</span>}
+      </div>
     </div>
   )
 }
