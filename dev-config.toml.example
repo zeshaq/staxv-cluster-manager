@@ -1,0 +1,27 @@
+# Copy to dev-config.toml (gitignored) and tweak for your box.
+# Dev: make dev  (air uses this via .air.toml args_bin)
+# Prod: /etc/staxv-cluster-manager/config.toml
+
+[server]
+addr = ":5002"      # coexists with staxv-hypervisor on :5001
+secure = false      # set true when behind TLS
+
+[log]
+level = "debug"
+
+[db]
+path = "./tmp/staxv-cm.db"
+
+[auth]
+# "db"  — bcrypt hash in users table (self-contained; default)
+# "pam" — verify against host /etc/shadow via pamtester.
+#         Requires: apt install pamtester, + /etc/pam.d/staxv-cluster-manager
+backend = "db"
+pam_service = "staxv-cluster-manager"
+secret_path = "./tmp/jwt.key"
+ttl = "24h"
+
+[secrets]
+# 32-byte AES-256 key for encrypting /api/settings values.
+# Auto-generated 0600 on first run. Back this up in prod.
+key_path = "./tmp/settings.key"

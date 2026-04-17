@@ -1,6 +1,7 @@
 # Memory Index
 
 - [Project context](project_context.md) — what staxv-cluster-manager is, relationship to hypervisor, roadmap
+- [Scaffold](scaffold.md) — repo layout, port assignments, PAM service name, pkg/ duplication policy, verification
 - [GitHub & project tracking](github.md) — labels, milestones, cross-repo conventions
 
 ## Design source of truth

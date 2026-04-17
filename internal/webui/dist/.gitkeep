@@ -1,0 +1,2 @@
+# Placeholder so go:embed all:dist succeeds on a fresh clone before
+# make frontend runs. Everything else here is gitignored.
