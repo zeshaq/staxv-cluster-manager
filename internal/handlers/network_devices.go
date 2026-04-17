@@ -51,6 +51,8 @@ func (h *NetworkDevicesHandler) Mount(r chi.Router, authMW func(http.Handler) ht
 		r.Get("/{id}/vlans", h.ListVLANs)
 		r.Post("/{id}/vlans", h.CreateVLAN)
 		r.Delete("/{id}/vlans/{vlan_id}", h.DeleteVLAN)
+		r.Get("/{id}/interfaces", h.ListInterfaces)
+		r.Post("/{id}/interface-ip", h.SetInterfaceIP)
 	})
 }
 
@@ -431,6 +433,88 @@ func (h *NetworkDevicesHandler) DeleteVLAN(w http.ResponseWriter, r *http.Reques
 	vlans, _ := cli.VLANs(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"vlans":         vlans,
+		"config_before": before,
+		"config_after":  after,
+	})
+}
+
+// ─── Interface IP management ─────────────────────────────────────
+//
+// List + single-interface IP set/clear. The edit path carries a
+// CIDR string (e.g. "10.1.1.1/24") so we get mask + host address in
+// one field; backend splits into IOS's `A.B.C.D M.M.M.M` form.
+//
+// As with VLANs, both writes return before/after running-config
+// snapshots (scoped to `section interface <name>`) for audit.
+
+// ListInterfaces merges `show ip interface brief` with
+// `show interfaces description`. Returns what the admin needs to
+// edit IPs: name, description, current IP, status, protocol.
+func (h *NetworkDevicesHandler) ListInterfaces(w http.ResponseWriter, r *http.Request) {
+	cli, _, ok := h.clientForDevice(w, r)
+	if !ok {
+		return
+	}
+	defer cli.Close()
+	ifaces, err := cli.Interfaces(r.Context())
+	if err != nil {
+		h.writeCiscoErr(w, err, "list interfaces")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"interfaces": ifaces})
+}
+
+// setInterfaceIPRequest is the payload for a single-interface IP
+// edit. `ip` in CIDR form ("10.1.1.1/24"), or empty string to clear.
+type setInterfaceIPRequest struct {
+	Name string `json:"name"`
+	IP   string `json:"ip"` // empty = clear
+}
+
+// SetInterfaceIP handles both the set and clear paths — discriminated
+// by whether IP is empty. Same pattern as the VLAN writes: validate,
+// dial, run config lines, return {interfaces, config_before,
+// config_after}.
+func (h *NetworkDevicesHandler) SetInterfaceIP(w http.ResponseWriter, r *http.Request) {
+	var req setInterfaceIPRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid body (expected {\"name\":\"...\",\"ip\":\"a.b.c.d/N\"})", http.StatusBadRequest)
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.IP = strings.TrimSpace(req.IP)
+	if !cisco.InterfaceNameRE.MatchString(req.Name) {
+		writeError(w, "invalid interface name (letters, digits, /, ., -)", http.StatusBadRequest)
+		return
+	}
+
+	cli, devName, ok := h.clientForDevice(w, r)
+	if !ok {
+		return
+	}
+	defer cli.Close()
+
+	var before, after string
+	var err error
+	if req.IP == "" {
+		before, after, err = cli.ClearInterfaceIP(r.Context(), req.Name)
+	} else {
+		before, after, err = cli.SetInterfaceIP(r.Context(), req.Name, req.IP)
+	}
+	if err != nil {
+		slog.Warn("interface IP update failed",
+			"device", devName, "iface", req.Name, "ip", req.IP, "err", err,
+			"config_before", before, "config_after", after)
+		h.writeCiscoErr(w, err, "update interface IP")
+		return
+	}
+	slog.Info("interface IP updated",
+		"device", devName, "iface", req.Name, "ip", req.IP,
+		"config_before", before, "config_after", after)
+
+	ifaces, _ := cli.Interfaces(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"interfaces":    ifaces,
 		"config_before": before,
 		"config_after":  after,
 	})

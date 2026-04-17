@@ -18,7 +18,8 @@ from `show version` model string with admin-override sticky.
 **Phase 2 shipped.** VLAN management — list, create, delete. UI
 gated to role ∈ {switch, l3-switch}.
 
-Phase 3 (interface IPs) still deferred.
+**Phase 3 shipped.** Interface IP management — list, set, clear.
+UI gated to role ∈ {router, l3-switch}.
 
 ## Scope (shipped)
 
@@ -102,6 +103,28 @@ Read + single-VLAN write. Bulk / range syntax deferred.
 **Audit trail** — every write logs before + after running-config snapshots via `slog.Info`. On failure, `slog.Warn` captures the same plus the error. Not yet a DB-backed audit log (deferred — a `network_device_changes` table with `{timestamp, actor, device_id, op, before_config, after_config}` is the clean shape).
 
 **Role-gated UI** — the `VLANSection` component on the device detail page only renders when `device.role ∈ {switch, l3-switch}`. Pure routers don't get the section (they can still manage VLANs via CLI; this just reflects the common case). Inside the section: inline add-VLAN form with client-side validation mirroring the backend's regex + ID range, per-row delete with confirm, collapsible "Last change" revealing before/after config snapshots from the response.
+
+### Interface IP management (Phase 3)
+
+Read + single-interface write. One CIDR per interface; the edit
+field carries both host + mask, which the backend splits into IOS's
+`ip address A.B.C.D M.M.M.M` form.
+
+- `GET  /api/network-devices/{id}/interfaces` — merges `show ip interface brief` with `show interfaces description`. Returns `[{name, description, ip, method, status, protocol}]`. `description` is best-effort — older IOS that rejects `show interfaces description` just leaves it empty.
+- `POST /api/network-devices/{id}/interface-ip` body `{name, ip}` — `ip` in CIDR form (`"10.1.1.1/24"`) OR empty string to clear. Validates name regex (`^[A-Za-z][A-Za-z0-9/.\-]+$`) at the handler, then runs:
+  - **Set**: `conf t / interface X / ip address A.B.C.D M.M.M.M / no shutdown / exit / end / wr mem` — `no shutdown` is automatic so admin doesn't forget it after assigning a fresh IP.
+  - **Clear**: `conf t / interface X / no ip address / exit / end / wr mem` — admin state stays as-is (admin might want the interface up without an IP, e.g. for a bridge member).
+
+**Interface-layer** in `pkg/cisco/interfaces.go`:
+- `Interface` type (name, description, ip, method, status, protocol). Mask NOT included in the list view — `show ip interface brief` doesn't carry it and pulling per-interface `show ip interface` on a 48-port switch is wasteful for a simple list. The edit form accepts CIDR anyway so the admin specifies mask at write time.
+- `Interfaces()` — list via the two commands mentioned above.
+- `SetInterfaceIP(name, cidr)` / `ClearInterfaceIP(name)` — return (before, after, err). `before` captured even on error.
+- `cidrToIOS(cidr)` — splits "10.1.1.1/24" → ("10.1.1.1", "255.255.255.0"). IPv4-only; rejects `/0`, `/33+`, IPv6, invalid shapes. Unit-tested.
+- `InterfaceNameRE` — server-side validation of names before we interpolate into config lines. Avoids any shell-injection-ish risks from typed names.
+
+**Config-mode reuse** — `RunConfigLines` + `ShowRunningConfig(section)` from Phase 2's config.go handle the low-level plumbing. Phase 3 just wires them to interface-specific commands.
+
+**Role-gated UI** — `InterfaceSection` on the device detail page only renders when `device.role ∈ {router, l3-switch}`. Pure L2 access switches rarely have per-port IPs (they use a management SVI); surfacing this editor on them would be confusing. Admin can still do it via CLI. Inside the section: lazy-loaded table with inline-edit pencil button per row — click opens a CIDR input pre-filled with the current IP + `/24` default, Enter to save, Escape to cancel. Blank input + Save clears the IP. Collapsible "Last change" at the bottom reveals before/after `show run | section interface <name>` snapshots.
 
 ### Offline bulk enrollment (CLI)
 
@@ -192,10 +215,6 @@ banner's trailing prompt.
 
 Planned but not shipped. Each its own commit:
 
-- **Phase 3 — Interface IP management.**
-  - `GET /api/network-devices/{id}/interfaces` — `show interfaces` + `show ip interface` for each; richer than the brief used in health
-  - `PUT /api/network-devices/{id}/interfaces/{iface}` body `{ip, mask}` or `{clear: true}` — `conf t / interface X / [no] ip address … / no shut / end / wr mem`
-  - UI edit-in-place per row
 - **Topology integration (optional)** — parse `show cdp neighbors detail` / `show lldp neighbors detail`, correlate MAC/IP to rows in `servers` table, show "server eth0 → switch1 Gi1/0/5" on the Servers page.
 - **Config backup** — periodic (cron-style goroutine) `show running-config` → versioned store (git-backed or DB table with history).
 - **OEM protocols where they buy us something** — NX-API for Nexus (structured JSON beats regex-parsing `show` output), RESTCONF/NETCONF on IOS-XE for transactional edits.

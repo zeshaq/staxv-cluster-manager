@@ -5,6 +5,7 @@ import {
   Router, RefreshCw, Trash2, CheckCircle, XCircle,
   AlertTriangle, HelpCircle, Cpu, MemoryStick, Tag, Network as NetIcon,
   Thermometer, Key, Gauge, Activity, Layers, Plus,
+  Pencil, Check as CheckIcon, X as XIcon,
 } from 'lucide-react'
 import api from '../api'
 import { ROLES, roleMeta } from './networkRoles'
@@ -510,6 +511,14 @@ export default function NetworkDeviceDetail() {
       {(device.role === 'switch' || device.role === 'l3-switch') && (
         <VLANSection id={id} />
       )}
+
+      {/* Interfaces — role-gated to router + l3-switch. Pure L2
+          switches rarely have IPs assigned per port (they use an SVI
+          or mgmt IP), so a "set IP" UI on an access switch would be
+          confusing. Admin can still do it via CLI if they need to. */}
+      {(device.role === 'router' || device.role === 'l3-switch') && (
+        <InterfaceSection id={id} />
+      )}
     </div>
   )
 }
@@ -713,6 +722,204 @@ function VLANSection({ id }) {
                 <details className="mt-4 text-xs text-slate-400">
                   <summary className="cursor-pointer hover:text-slate-200">
                     Last change — <span className="text-slate-500">before / after <span className="font-mono">show run | section vlan</span></span>
+                  </summary>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                    <div>
+                      <div className="text-[10px] font-semibold tracking-wider uppercase text-slate-500 mb-1">Before</div>
+                      <pre className="bg-canvas-900/60 border border-canvas-500 rounded p-2 overflow-x-auto text-[11px] text-slate-300 whitespace-pre">{lastDiff.before || '(empty)'}</pre>
+                    </div>
+                    <div>
+                      <div className="text-[10px] font-semibold tracking-wider uppercase text-slate-500 mb-1">After</div>
+                      <pre className="bg-canvas-900/60 border border-canvas-500 rounded p-2 overflow-x-auto text-[11px] text-slate-300 whitespace-pre">{lastDiff.after || '(empty)'}</pre>
+                    </div>
+                  </div>
+                </details>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Interface IPs ───────────────────────────────────────────────
+//
+// Lazy-loaded interface list with per-row inline IP editing. Admin
+// clicks the pencil icon next to an IP → it swaps to a text input
+// expecting CIDR notation ("10.1.1.1/24"). Submit POSTs to the
+// backend which runs `interface X / ip address A.B.C.D M.M.M.M /
+// no shutdown / end / wr mem`. Leave the field blank and submit to
+// clear the IP.
+//
+// Like VLANSection, surfaces before/after running-config snapshots
+// in a collapsible "Last change" detail at the bottom.
+function InterfaceSection({ id }) {
+  const [ifaces, setIfaces] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState('')
+  const [open, setOpen] = useState(false)
+  const [editing, setEditing] = useState(null)  // iface name currently being edited
+  const [draftIP, setDraftIP] = useState('')
+  const [busy, setBusy] = useState(null)        // iface name being submitted
+  const [lastDiff, setLastDiff] = useState(null)
+
+  const load = async () => {
+    setLoading(true); setErr('')
+    try {
+      const r = await api.get(`/network-devices/${id}/interfaces`)
+      setIfaces(r.data.interfaces || [])
+    } catch (e) {
+      setErr(e.response?.data?.error || 'Failed to load interfaces')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const toggle = () => {
+    const next = !open
+    setOpen(next)
+    if (next && ifaces === null && !loading) load()
+  }
+
+  const startEdit = (iface) => {
+    setEditing(iface.name)
+    // Prefill with current IP + /24 as a sensible default mask.
+    // Admin can adjust. If iface has no IP, start blank.
+    setDraftIP(iface.ip ? `${iface.ip}/24` : '')
+    setErr('')
+  }
+
+  const cancelEdit = () => {
+    setEditing(null); setDraftIP(''); setErr('')
+  }
+
+  const saveEdit = async (iface) => {
+    // Empty = clear. Otherwise validate CIDR client-side before
+    // round-tripping — catches obvious typos without an SSH call.
+    const ip = draftIP.trim()
+    if (ip !== '' && !/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(ip)) {
+      setErr('IP must be CIDR form (e.g. 10.1.1.1/24), or blank to clear')
+      return
+    }
+    setBusy(iface.name); setErr('')
+    try {
+      const r = await api.post(`/network-devices/${id}/interface-ip`, {
+        name: iface.name, ip,
+      })
+      setIfaces(r.data.interfaces || [])
+      setLastDiff({ before: r.data.config_before, after: r.data.config_after })
+      setEditing(null); setDraftIP('')
+    } catch (e) {
+      setErr(e.response?.data?.error || 'Update failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const Chevron = open ? ChevronDown : ChevronRight
+
+  return (
+    <div className="bg-canvas-800 border border-canvas-500 rounded-xl overflow-hidden">
+      <button
+        onClick={toggle}
+        className="w-full px-5 py-3 border-b border-canvas-500 flex items-center gap-2 hover:bg-canvas-700/50 transition-colors text-left"
+      >
+        <Chevron size={14} className="text-slate-500 flex-shrink-0" />
+        <NetIcon size={13} className="text-brand-400 flex-shrink-0" />
+        <h3 className="text-slate-300 text-xs font-semibold tracking-wider uppercase flex-shrink-0">Interface IPs</h3>
+        <span className="text-slate-500 text-xs truncate">· assign / clear IPs (runs <span className="font-mono">wr mem</span>)</span>
+        {open && (
+          <span
+            role="button"
+            tabIndex={0}
+            onClick={(e) => { e.stopPropagation(); load() }}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); load() } }}
+            className="ml-auto flex items-center gap-1 text-slate-500 hover:text-brand-300 text-[11px] cursor-pointer"
+          >
+            <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
+            {loading ? 'Loading…' : 'Reload'}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div className="px-5 py-4">
+          {loading && !ifaces && <div className="text-slate-500 text-sm py-6 text-center">Loading…</div>}
+          {err && (
+            <div className="bg-red-900/20 border border-red-900/40 text-red-300 text-xs rounded-lg px-3 py-2 mb-3 font-mono break-all">{err}</div>
+          )}
+
+          {ifaces && (
+            <>
+              <SubTable
+                icon={NetIcon}
+                title="Interfaces"
+                count={ifaces.length}
+                rows={ifaces}
+                cols={[
+                  { header: 'Name', render: r => <span className="font-mono text-slate-400">{r.name}</span> },
+                  { header: 'Description', render: r => r.description || null },
+                  { header: 'IP (CIDR)', render: r => {
+                      if (editing === r.name) {
+                        return (
+                          <input
+                            autoFocus
+                            value={draftIP}
+                            onChange={e => setDraftIP(e.target.value)}
+                            onKeyDown={e => {
+                              if (e.key === 'Escape') cancelEdit()
+                              if (e.key === 'Enter') saveEdit(r)
+                            }}
+                            placeholder="10.1.1.1/24  (blank = clear)"
+                            className="bg-canvas-900 border border-brand-500/60 text-slate-100 rounded px-2 py-0.5 text-[11px] font-mono w-40 focus:outline-none"
+                          />
+                        )
+                      }
+                      return r.ip
+                        ? <span className="font-mono text-[11px]">{r.ip}</span>
+                        : <span className="text-slate-600 text-[11px] italic">unassigned</span>
+                    } },
+                  { header: 'Method', render: r => <span className="text-[11px] text-slate-500">{r.method}</span> },
+                  { header: 'Status', render: r => <LinkPill status={r.status} /> },
+                  { header: 'Protocol', render: r => <LinkPill status={r.protocol} /> },
+                  { header: '', render: r => editing === r.name ? (
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => saveEdit(r)}
+                          disabled={busy === r.name}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded text-lime-300 hover:bg-lime-900/30 border border-lime-700/30 text-[11px] disabled:opacity-50"
+                          title="Save"
+                        >
+                          {busy === r.name ? <RefreshCw size={10} className="animate-spin" /> : <CheckIcon size={10} />}
+                          Save
+                        </button>
+                        <button
+                          onClick={cancelEdit}
+                          disabled={busy === r.name}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded text-slate-400 hover:bg-canvas-700 border border-canvas-500 text-[11px] disabled:opacity-50"
+                          title="Cancel"
+                        >
+                          <XIcon size={10} /> Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => startEdit(r)}
+                        disabled={busy !== null}
+                        className="flex items-center gap-1 px-2 py-0.5 rounded text-brand-300 hover:bg-brand-500/10 border border-brand-500/30 text-[11px] disabled:opacity-50"
+                        title="Edit IP"
+                      >
+                        <Pencil size={10} /> Edit
+                      </button>
+                    ) },
+                ]}
+              />
+
+              {lastDiff && (
+                <details className="mt-4 text-xs text-slate-400">
+                  <summary className="cursor-pointer hover:text-slate-200">
+                    Last change — <span className="text-slate-500">before / after <span className="font-mono">show run | section interface</span></span>
                   </summary>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
                     <div>
