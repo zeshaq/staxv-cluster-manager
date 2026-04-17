@@ -6,6 +6,7 @@ import {
   AlertTriangle, HelpCircle, Cpu, MemoryStick, Tag, Network,
   Power, PowerOff, RotateCw, Zap, Thermometer, Key, Play, Square,
   Fan, Wind, Gauge, CircuitBoard,
+  Disc3, Rocket, X,
 } from 'lucide-react'
 import api from '../api'
 
@@ -200,9 +201,155 @@ function ExpandableSection({ icon: Icon, title, subtitle, load, render, defaultO
           {err && (
             <div className="bg-red-900/20 border border-red-900/40 text-red-300 text-xs rounded-lg px-3 py-2 mb-3 font-mono break-all">{err}</div>
           )}
-          {data && render(data)}
+          {data && render(data, { reload: doLoad })}
         </div>
       )}
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────
+// ISOPicker — modal for choosing an ISO + slot. Used by both
+// "Mount ISO" (single action) and "Boot from ISO" (mount + boot
+// override + restart). The caller decides which API to hit and
+// what warning to show.
+//
+// Fetches the ISO catalog on open, filters to status=ready, and
+// shows a compact list with OS type + version + size + description.
+// ─────────────────────────────────────────────────────────────
+function ISOPicker({ open, onClose, title, confirmLabel, confirmTone, warning, slots, defaultSlot, onConfirm }) {
+  const [isos, setIsos] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState('')
+  const [selectedIso, setSelectedIso] = useState(null)
+  const [slot, setSlot] = useState(defaultSlot || '')
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    setSelectedIso(null); setErr(''); setSlot(defaultSlot || '')
+    setLoading(true)
+    api.get('/isos')
+      .then(r => setIsos((r.data.isos || []).filter(i => i.status === 'ready')))
+      .catch(e => setErr(e.response?.data?.error || 'Failed to load ISOs'))
+      .finally(() => setLoading(false))
+  }, [open, defaultSlot])
+
+  if (!open) return null
+
+  const submit = async () => {
+    if (!selectedIso) { setErr('Pick an ISO'); return }
+    setBusy(true); setErr('')
+    try {
+      await onConfirm(selectedIso, slot)
+      onClose()
+    } catch (e) {
+      setErr(e.response?.data?.error || 'Action failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // CD/DVD-capable slots only — the backend auto-picks one when slot
+  // is empty, but letting the admin see + override is useful on boxes
+  // with multiple ISO-capable slots (rare but possible).
+  const cdSlots = (slots || []).filter(s => (s.media_types || []).some(m => ['CD', 'DVD', 'CDROM'].includes(m.toUpperCase())))
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={onClose}>
+      <div
+        className="bg-canvas-800 border border-canvas-500 rounded-xl w-full max-w-2xl max-h-[85vh] flex flex-col shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-5 py-3 border-b border-canvas-500 flex items-center justify-between">
+          <h3 className="text-slate-100 font-semibold">{title}</h3>
+          <button onClick={onClose} className="p-1 rounded text-slate-500 hover:text-slate-200 hover:bg-canvas-700">
+            <X size={14} />
+          </button>
+        </div>
+
+        <div className="px-5 py-4 overflow-y-auto flex-1">
+          {warning && (
+            <div className="bg-amber-900/20 border border-amber-900/50 text-amber-200 text-xs rounded-lg px-3 py-2 mb-4 flex items-start gap-2">
+              <AlertTriangle size={13} className="flex-shrink-0 mt-0.5" />
+              <span>{warning}</span>
+            </div>
+          )}
+          {err && (
+            <div className="bg-red-900/30 border border-red-900/50 text-red-300 text-xs rounded-lg px-3 py-2 mb-4 font-mono break-all">{err}</div>
+          )}
+
+          {loading ? (
+            <div className="text-slate-500 text-sm py-6 text-center">Loading catalog…</div>
+          ) : isos.length === 0 ? (
+            <div className="text-slate-500 text-sm py-6 text-center italic">
+              No ready ISOs. Upload or import one from the ISO library first.
+            </div>
+          ) : (
+            <div className="space-y-1.5 mb-4">
+              {isos.map(iso => {
+                const sel = selectedIso?.id === iso.id
+                return (
+                  <button
+                    key={iso.id}
+                    onClick={() => setSelectedIso(iso)}
+                    className={`w-full text-left rounded-lg border px-3 py-2.5 transition-colors flex items-center gap-3 ${
+                      sel
+                        ? 'bg-brand-500/10 border-brand-500/60 ring-1 ring-brand-500/40'
+                        : 'bg-canvas-900/40 border-canvas-500 hover:border-brand-500/30 hover:bg-canvas-700/50'
+                    }`}
+                  >
+                    <Disc3 size={18} className={sel ? 'text-brand-400' : 'text-slate-500'} />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-slate-100 text-sm font-medium truncate">{iso.name}</div>
+                      <div className="text-slate-500 text-[11px] font-mono truncate">
+                        {iso.filename} · {fmtBytes(iso.size_bytes)}{iso.os_version ? ` · ${iso.os_version}` : ''}
+                      </div>
+                    </div>
+                    <span className="text-[10px] uppercase tracking-wider text-slate-500 flex-shrink-0">{iso.os_type}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+
+          {cdSlots.length > 1 && (
+            <div>
+              <label className="block text-[11px] font-semibold tracking-wider uppercase text-slate-400 mb-1.5">
+                Virtual media slot
+              </label>
+              <select
+                value={slot}
+                onChange={(e) => setSlot(e.target.value)}
+                className="w-full bg-canvas-900 border border-canvas-500 focus:border-brand-500 text-slate-100 rounded px-3 py-2 text-sm focus:outline-none"
+              >
+                <option value="">Auto-pick first CD/DVD slot</option>
+                {cdSlots.map(s => (
+                  <option key={s.id} value={s.id}>{s.name} ({s.id}){s.inserted ? ' — currently mounted' : ''}</option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+
+        <div className="px-5 py-3 border-t border-canvas-500 flex items-center justify-end gap-2">
+          <button onClick={onClose} disabled={busy} className="px-4 py-2 rounded text-slate-400 hover:text-slate-200 text-sm">
+            Cancel
+          </button>
+          <button
+            onClick={submit}
+            disabled={busy || !selectedIso}
+            className={`flex items-center gap-2 disabled:opacity-50 font-semibold px-4 py-2 rounded text-sm transition-colors ${
+              confirmTone === 'danger'
+                ? 'bg-red-500 hover:bg-red-400 text-white'
+                : 'bg-brand-500 hover:bg-brand-400 text-canvas-900'
+            }`}
+          >
+            {busy ? <RefreshCw size={13} className="animate-spin" /> : <Rocket size={13} />}
+            {busy ? 'Working…' : confirmLabel}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -286,6 +433,12 @@ export default function ServerDetail() {
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(null)  // 'test' | 'delete'
+  // ISO picker state. mode controls the API + messaging:
+  //   'mount' → POST /mount-iso, no restart
+  //   'boot'  → POST /boot-from-iso, mount + one-shot boot override + reset
+  // slots is passed in from the Virtual Media section so the picker can
+  // show a slot dropdown when multiple CD/DVD-capable slots exist.
+  const [picker, setPicker] = useState({ open: false, mode: 'mount', slots: [] })
 
   const fetchOne = async () => {
     setLoading(true)
@@ -486,6 +639,34 @@ export default function ServerDetail() {
         </p>
       </Section>
 
+      {/* Virtual Media — Redfish VirtualMedia.InsertMedia / EjectMedia.
+          Lazy-loaded slot listing (typically CD, USB, Floppy on iLO/iDRAC).
+          Mount button picks a ready ISO from the library and tells the
+          BMC to fetch it from /iso/{id}/{filename}. "Boot from ISO" is
+          the one-shot installer flow: mount + one-shot BootSourceOverride
+          + reset. */}
+      <ExpandableSection
+        icon={Disc3}
+        title="Virtual media"
+        subtitle="Mount ISOs for OS install"
+        load={() => api.get(`/servers/${id}/virtual-media`).then(r => r.data)}
+        render={(vm, { reload }) => (
+          <VirtualMediaBlock
+            slots={vm.slots || []}
+            onMount={() => setPicker({ open: true, mode: 'mount',  slots: vm.slots || [] })}
+            onBoot ={() => setPicker({ open: true, mode: 'boot',   slots: vm.slots || [] })}
+            onEject={async (slot) => {
+              try {
+                await api.post(`/servers/${id}/eject-iso`, { slot })
+                reload()
+              } catch (e) {
+                alert(e.response?.data?.error || 'Eject failed')
+              }
+            }}
+          />
+        )}
+      />
+
       {/* Hardware inventory — CPUs, DIMMs, Drives, NICs.
           Lazy-loaded: first expand fires a single GET that fans out to
           four Redfish collections in parallel on the backend. 2-5s on
@@ -642,6 +823,120 @@ export default function ServerDetail() {
             />
           </>
         )}
+      />
+
+      {/* ISO picker modal — rendered at the page root so it escapes
+          any overflow/stacking context of the expandable sections.
+          Shared between "Mount ISO" and "Boot from ISO". */}
+      <ISOPicker
+        open={picker.open}
+        onClose={() => setPicker(p => ({ ...p, open: false }))}
+        slots={picker.slots}
+        title={picker.mode === 'boot' ? 'Boot from ISO' : 'Mount ISO'}
+        confirmLabel={picker.mode === 'boot' ? 'Mount & restart' : 'Mount'}
+        confirmTone={picker.mode === 'boot' ? 'danger' : 'brand'}
+        warning={picker.mode === 'boot'
+          ? `This will mount the ISO, set a one-shot boot override to Cd, and ${server.power_state === 'Off' ? 'power on the server' : 'force-restart the server'}. Any running workload on "${server.name}" will be interrupted.`
+          : null}
+        onConfirm={async (iso, slot) => {
+          const endpoint = picker.mode === 'boot' ? 'boot-from-iso' : 'mount-iso'
+          const r = await api.post(`/servers/${id}/${endpoint}`, { iso_id: iso.id, slot })
+          if (picker.mode === 'boot' && r.data?.id) {
+            // boot-from-iso returns the refreshed server row; fold it in.
+            setServer(r.data)
+          }
+          // Force the Virtual Media section to re-fetch slots next open.
+          // Caller (ExpandableSection.render) can't reload from here —
+          // easiest is to refetch the server detail so the user sees
+          // fresh power state, and the admin can expand/reload VM
+          // manually if they want updated slot state.
+          fetchOne()
+        }}
+      />
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────
+// VirtualMediaBlock — renders inside the Virtual Media expandable
+// section. Shows one row per BMC slot (name, types, inserted state)
+// with per-slot eject + top-level Mount / Boot buttons.
+//
+// Lives outside ServerDetail() so the parent component stays
+// readable; state (picker open, mount progress) lives in the parent.
+// ─────────────────────────────────────────────────────────────
+function VirtualMediaBlock({ slots, onMount, onBoot, onEject }) {
+  const hasCDSlot = slots.some(s => (s.media_types || []).some(m => ['CD', 'DVD', 'CDROM'].includes(m.toUpperCase())))
+  const [busyEject, setBusyEject] = useState(null)
+
+  const doEject = async (slot) => {
+    if (!confirm(`Eject media from slot ${slot}? Any in-progress OS install will be interrupted.`)) return
+    setBusyEject(slot)
+    try { await onEject(slot) } finally { setBusyEject(null) }
+  }
+
+  return (
+    <div>
+      {/* Action buttons — top of section so they're easy to reach.
+          Mount is the safe variant; Boot-from-ISO is the "kick off an
+          install" flow and carries the restart warning in its picker. */}
+      <div className="flex flex-wrap gap-2 mb-4">
+        <button
+          onClick={onMount}
+          disabled={!hasCDSlot}
+          title={hasCDSlot ? 'Mount an ISO on a CD/DVD slot' : 'BMC exposes no CD/DVD-capable slot'}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded border text-xs font-semibold bg-canvas-700 hover:bg-canvas-600 text-slate-200 border-canvas-500 hover:border-brand-500/60 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        >
+          <Disc3 size={12} /> Mount ISO…
+        </button>
+        <button
+          onClick={onBoot}
+          disabled={!hasCDSlot}
+          title={hasCDSlot ? 'Mount + boot override + reset — installs the OS' : 'BMC exposes no CD/DVD-capable slot'}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded border text-xs font-semibold bg-brand-500 hover:bg-brand-400 text-canvas-900 border-transparent disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        >
+          <Rocket size={12} /> Boot from ISO…
+        </button>
+      </div>
+
+      {/* Slot table — one row per BMC virtual-media device. */}
+      <SubTable
+        icon={Disc3}
+        title="Slots"
+        count={slots.length}
+        rows={slots}
+        cols={[
+          { header: 'Slot', render: s => <span className="font-mono text-slate-400">{s.id}</span> },
+          { header: 'Name', render: s => s.name },
+          { header: 'Media types', render: s => (s.media_types || []).length ? (
+              <span className="text-[11px] text-slate-400">{s.media_types.join(', ')}</span>
+            ) : null },
+          { header: 'State', render: s => s.inserted ? (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-brand-500/10 text-brand-300 ring-1 ring-brand-500/30 text-[10px] font-medium">
+                <CheckCircle size={9} /> Inserted
+              </span>
+            ) : (
+              <span className="text-slate-600 text-[11px] italic">Empty</span>
+            ) },
+          { header: 'Image', render: s => s.image ? (
+              <span className="font-mono text-[11px] text-slate-400 break-all" title={s.image}>
+                {s.image.length > 60 ? s.image.slice(0, 60) + '…' : s.image}
+              </span>
+            ) : null },
+          { header: 'Via', render: s => s.connected_via ? <span className="text-slate-500 text-[11px]">{s.connected_via}</span> : null },
+          { header: '', render: s => s.inserted ? (
+              <button
+                onClick={() => doEject(s.id)}
+                disabled={busyEject === s.id}
+                className="flex items-center gap-1 px-2 py-0.5 rounded text-red-300 hover:bg-red-900/30 border border-red-700/30 text-[11px] disabled:opacity-50"
+                title="Eject"
+              >
+                {busyEject === s.id ? <RefreshCw size={10} className="animate-spin" /> : <XCircle size={10} />}
+                Eject
+              </button>
+            ) : null },
+        ]}
+        empty="BMC reported no virtual-media slots"
       />
     </div>
   )

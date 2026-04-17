@@ -90,9 +90,12 @@ All five cases passed on the first run after fixing the rsync-path bug:
 5. **URL import from local `python3 -m http.server`** → `downloading` → `ready` in < 2 s, size + sha256 populated, served byte-identical.
 6. **DELETE** → HTTP 204, file removed from disk.
 
+## Cross-link: Virtual Media wiring
+
+Redfish `VirtualMedia.InsertMedia` is now shipped on the server side — see [servers.md §"Virtual Media (ISO mount via BMC)"](servers.md#virtual-media-iso-mount-via-bmc) for the endpoints, the client library, and the UI. The mount flow calls back into our `/iso/{id}/{filename}` serve route (this doc, §"BMC-facing serve"). The admin's request scheme/host is what the backend hands to the BMC — so admin and BMC need a reachable common URL.
+
 ## Scope (deferred — obvious next commits)
 
-- **Redfish `VirtualMedia.InsertMedia` wiring** — `POST /api/servers/{id}/mount-iso` body `{iso_id}` that calls `/redfish/v1/Managers/{id}/VirtualMedia/{slot}/Actions/VirtualMedia.InsertMedia` with the `/iso/{id}/{filename}` URL. Plus "Boot from ISO" button on server detail page that triggers mount + `POST .../Actions/ComputerSystem.Reset {"ResetType":"ForceRestart"}` + one-time boot override.
 - **Tokenized serve URLs** — short-lived HMAC tokens so the BMC URL rotates per-mount; stops anyone-on-mgmt-LAN from leeching ISOs.
 - **Integrity verification** — pre-mount, optionally check vendor checksums. Frontend form field for "expected SHA256" that we compare after download.
 - **Curated catalog** — "import Ubuntu 24.04" one-click with a known-good URL list per distro. Lives in config, not code, so operators can pin mirror choices.

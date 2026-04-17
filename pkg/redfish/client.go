@@ -71,6 +71,7 @@ type serviceRoot struct {
 	RedfishVersion string `json:"RedfishVersion"`
 	Systems        odata  `json:"Systems"`
 	Chassis        odata  `json:"Chassis"`
+	Managers       odata  `json:"Managers"`
 }
 
 type odata struct {
@@ -220,6 +221,31 @@ func (c *Client) firstSystemURL(ctx context.Context) (string, error) {
 	return strings.TrimRight(coll.Members[0].ID, "/"), nil
 }
 
+// firstManagerURL is the Managers-side analog of firstSystemURL.
+// VirtualMedia resources live under /Managers/{id}/VirtualMedia — a BMC
+// manages its own virtual-media slots (floppy, USB, CD), not the host
+// system's real drives. Exactly one Manager per server is the norm;
+// multi-manager boxes (blade chassis management) return the first.
+//
+// Same ("", nil) vs ("", err) semantics as the other walkers.
+func (c *Client) firstManagerURL(ctx context.Context) (string, error) {
+	var root serviceRoot
+	if err := c.getJSON(ctx, c.baseURL.String(), &root); err != nil {
+		return "", fmt.Errorf("service root: %w", err)
+	}
+	if root.Managers.ID == "" {
+		return "", nil
+	}
+	var coll collection
+	if err := c.getJSON(ctx, c.absURL(root.Managers.ID), &coll); err != nil {
+		return "", fmt.Errorf("managers collection: %w", err)
+	}
+	if len(coll.Members) == 0 {
+		return "", nil
+	}
+	return strings.TrimRight(coll.Members[0].ID, "/"), nil
+}
+
 // firstChassisURL is the Chassis-side analog of firstSystemURL.
 // Thermal / Power resources live under the Chassis, not the System —
 // they represent physical hardware (fans, PSUs) rather than the logical
@@ -292,6 +318,44 @@ func (c *Client) postJSON(ctx context.Context, rawURL string, body any) error {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("OData-Version", "4.0")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return &NetError{Err: err}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return &AuthError{Status: resp.StatusCode}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return &HTTPError{Status: resp.StatusCode, Body: string(respBody)}
+	}
+	return nil
+}
+
+// patchJSON is POST's sibling for partial updates — Redfish uses PATCH
+// for attribute mutations like Boot.BootSourceOverrideTarget. Body
+// semantics match postJSON.
+func (c *Client) patchJSON(ctx context.Context, rawURL string, body any) error {
+	buf := new(bytes.Buffer)
+	if body != nil {
+		if err := json.NewEncoder(buf).Encode(body); err != nil {
+			return err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, "PATCH", rawURL, buf)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(c.username, c.password)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("OData-Version", "4.0")
+	// Some BMCs (iLO in particular) require If-Match: * or the current
+	// ETag on PATCH. "*" matches anything and skips the read-modify-write
+	// dance — fine for our one-shot boot override writes.
+	req.Header.Set("If-Match", "*")
 
 	resp, err := c.http.Do(req)
 	if err != nil {

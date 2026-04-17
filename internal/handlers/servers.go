@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -25,10 +26,15 @@ import (
 // v1; add a per-server ACL table if that ever becomes a need.
 type ServersHandler struct {
 	store *db.ServerStore
+	// isoStore lets mount/boot-from-iso look up the ISO row so we can
+	// enforce status=ready and construct the BMC-facing serve URL using
+	// the stored filename. Kept optional (nil = ISO features disabled)
+	// for future deployments that might run servers-only.
+	isoStore *db.ISOStore
 }
 
-func NewServersHandler(store *db.ServerStore) *ServersHandler {
-	return &ServersHandler{store: store}
+func NewServersHandler(store *db.ServerStore, isoStore *db.ISOStore) *ServersHandler {
+	return &ServersHandler{store: store, isoStore: isoStore}
 }
 
 // Mount attaches /api/servers routes under authMW + RequireAdmin.
@@ -45,6 +51,10 @@ func (h *ServersHandler) Mount(r chi.Router, authMW func(http.Handler) http.Hand
 		r.Post("/{id}/power", h.Power)
 		r.Get("/{id}/hardware", h.Hardware)
 		r.Get("/{id}/health", h.Health)
+		r.Get("/{id}/virtual-media", h.VirtualMedia)
+		r.Post("/{id}/mount-iso", h.MountISO)
+		r.Post("/{id}/eject-iso", h.EjectISO)
+		r.Post("/{id}/boot-from-iso", h.BootFromISO)
 	})
 }
 
@@ -468,6 +478,280 @@ func (h *ServersHandler) clientForServer(w http.ResponseWriter, r *http.Request)
 	username, password, err := h.store.GetCredentials(r.Context(), id)
 	if err != nil {
 		slog.Error("inventory: decrypt creds", "err", err, "id", id)
+		writeError(w, "credentials unavailable", http.StatusInternalServerError)
+		return nil, "", false
+	}
+	return redfish.New(srv.BMCHost, srv.BMCPort, username, password), srv.Name, true
+}
+
+// VirtualMedia lists the BMC's virtual-media slots and their current
+// state (inserted image, connected_via, media types). Used by the UI
+// to render the slot picker and by the admin to confirm what's mounted.
+func (h *ServersHandler) VirtualMedia(w http.ResponseWriter, r *http.Request) {
+	cli, _, ok := h.clientForServer(w, r)
+	if !ok {
+		return
+	}
+	slots, err := cli.VirtualMedia(r.Context())
+	if err != nil {
+		slog.Warn("virtual media list failed", "err", err)
+		h.writeRedfishErr(w, err, "list virtual media")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"slots": slots})
+}
+
+// MountISO attaches an ISO from our library to a BMC virtual-media slot.
+// Body: {"iso_id": 42, "slot": "2"} (slot optional → auto-pick CD/DVD).
+//
+// The BMC fetches the ISO from our /iso/{id}/{filename} serve route
+// (no auth — document-mandated; see isos.md). The URL uses the same
+// scheme/host the admin's browser hit, under the assumption the admin
+// and BMC share a reachable path to the CM. Cross-network deployments
+// will need an [isos] serve_base_url override, deferred to follow-up.
+func (h *ServersHandler) MountISO(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseInt64Param(w, r, "id")
+	if !ok {
+		return
+	}
+	var req struct {
+		ISOID int64  `json:"iso_id"`
+		Slot  string `json:"slot"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid body (expected {\"iso_id\":N,\"slot\":\"?\"})", http.StatusBadRequest)
+		return
+	}
+	if req.ISOID == 0 {
+		writeError(w, "iso_id is required", http.StatusBadRequest)
+		return
+	}
+
+	iso, imageURL, err := h.resolveISO(r, req.ISOID)
+	if err != nil {
+		h.writeISOLookupErr(w, err)
+		return
+	}
+
+	cli, srvName, ok := h.clientForServerID(w, r, id)
+	if !ok {
+		return
+	}
+	if err := cli.InsertMedia(r.Context(), req.Slot, imageURL); err != nil {
+		slog.Warn("insert media failed", "server", srvName, "iso", iso.Filename, "err", err)
+		h.writeRedfishErr(w, err, "mount ISO")
+		return
+	}
+
+	slog.Info("iso mounted",
+		"server_id", id, "server", srvName,
+		"iso_id", iso.ID, "iso", iso.Filename,
+		"slot", req.Slot, "url", imageURL,
+	)
+	// Re-list so the response carries the fresh slot state (Inserted=true,
+	// Image=<our url>). Cheap — same round trip the UI would do anyway.
+	slots, _ := cli.VirtualMedia(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{"slots": slots})
+}
+
+// EjectISO dismounts whatever's on the named slot. Body: {"slot": "2"}.
+// Slot is required — unlike mount we don't auto-pick, since "eject the
+// first slot with something in it" is ambiguous when multiple are
+// mounted.
+func (h *ServersHandler) EjectISO(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Slot string `json:"slot"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid body (expected {\"slot\":\"...\"})", http.StatusBadRequest)
+		return
+	}
+	if req.Slot == "" {
+		writeError(w, "slot is required", http.StatusBadRequest)
+		return
+	}
+	cli, srvName, ok := h.clientForServer(w, r)
+	if !ok {
+		return
+	}
+	if err := cli.EjectMedia(r.Context(), req.Slot); err != nil {
+		slog.Warn("eject media failed", "server", srvName, "slot", req.Slot, "err", err)
+		h.writeRedfishErr(w, err, "eject ISO")
+		return
+	}
+	slog.Info("iso ejected", "server", srvName, "slot", req.Slot)
+	slots, _ := cli.VirtualMedia(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{"slots": slots})
+}
+
+// BootFromISO is the full "install this OS" convenience: mount + one-
+// shot boot override + reset. The three BMC calls run serially — each
+// depends on the prior. No rollback on failure; if Insert succeeded but
+// Boot override failed, the admin sees "mounted, boot override failed"
+// in the error and can retry / eject manually.
+//
+// Body: {"iso_id": 42, "slot": "2"} (slot optional).
+//
+// Power handling: if the system is Off we send "On" (boot from the
+// newly-inserted virtual CD); otherwise "ForceRestart" (reset is the
+// reliable path — a halted OS ignores GracefulRestart).
+func (h *ServersHandler) BootFromISO(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseInt64Param(w, r, "id")
+	if !ok {
+		return
+	}
+	var req struct {
+		ISOID int64  `json:"iso_id"`
+		Slot  string `json:"slot"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid body (expected {\"iso_id\":N,\"slot\":\"?\"})", http.StatusBadRequest)
+		return
+	}
+	if req.ISOID == 0 {
+		writeError(w, "iso_id is required", http.StatusBadRequest)
+		return
+	}
+
+	iso, imageURL, err := h.resolveISO(r, req.ISOID)
+	if err != nil {
+		h.writeISOLookupErr(w, err)
+		return
+	}
+
+	srv, err := h.store.GetServer(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, "not found", http.StatusNotFound)
+			return
+		}
+		writeError(w, "lookup failed", http.StatusInternalServerError)
+		return
+	}
+	username, password, err := h.store.GetCredentials(r.Context(), id)
+	if err != nil {
+		slog.Error("boot-from-iso: decrypt creds", "err", err, "id", id)
+		writeError(w, "credentials unavailable", http.StatusInternalServerError)
+		return
+	}
+	cli := redfish.New(srv.BMCHost, srv.BMCPort, username, password)
+
+	// Step 1: mount.
+	if err := cli.InsertMedia(r.Context(), req.Slot, imageURL); err != nil {
+		slog.Warn("boot-from-iso: insert failed", "server", srv.Name, "err", err)
+		h.writeRedfishErr(w, err, "mount ISO")
+		return
+	}
+	// Step 2: boot override. One-shot, reverts after next boot.
+	if err := cli.SetBootOverride(r.Context(), "Cd", "Once"); err != nil {
+		slog.Warn("boot-from-iso: boot override failed", "server", srv.Name, "err", err)
+		// Leave the media mounted — admin might want to retry boot
+		// override separately rather than re-mount.
+		h.writeRedfishErr(w, err, "set boot override (ISO mounted — eject manually if aborting)")
+		return
+	}
+	// Step 3: reset. Pick ResetType based on current power state.
+	resetType := redfish.ResetForceRestart
+	if srv.PowerState == "Off" {
+		resetType = redfish.ResetOn
+	}
+	if err := cli.PowerAction(r.Context(), resetType); err != nil {
+		slog.Warn("boot-from-iso: reset failed", "server", srv.Name, "reset_type", resetType, "err", err)
+		h.writeRedfishErr(w, err, "restart (ISO mounted + boot override set — power on manually)")
+		return
+	}
+
+	slog.Info("boot-from-iso triggered",
+		"server_id", id, "server", srv.Name,
+		"iso_id", iso.ID, "iso", iso.Filename,
+		"slot", req.Slot, "reset_type", resetType, "url", imageURL,
+	)
+
+	// Refresh power_state — same pattern as Power handler.
+	probe := h.probe(r.Context(), id, srv.BMCHost, srv.BMCPort, username, password)
+	if err := h.store.UpdateReachability(r.Context(), id, probe); err != nil {
+		slog.Warn("boot-from-iso: update reachability", "err", err, "id", id)
+	}
+	fresh, _ := h.store.GetServer(r.Context(), id)
+	if fresh == nil {
+		fresh = srv
+	}
+	writeJSON(w, http.StatusOK, fresh)
+}
+
+// resolveISO loads the ISO row, validates status=ready, and builds the
+// absolute BMC-facing serve URL from the request's Host + scheme. The
+// URL points at /iso/{id}/{filename} — the public (no-auth) route BMCs
+// fetch from.
+//
+// Scheme: honors X-Forwarded-Proto when present (reverse-proxy-safe),
+// falls back to https when the request itself was TLS, else http.
+// Host: incoming request's Host header. Same assumption as the "Copy
+// URL" button on the ISOs page — admin's browser and the BMC share a
+// path to the CM. Cross-network deployments will need a config knob.
+func (h *ServersHandler) resolveISO(r *http.Request, isoID int64) (*db.ISO, string, error) {
+	if h.isoStore == nil {
+		return nil, "", errors.New("ISO store not wired")
+	}
+	iso, err := h.isoStore.GetISO(r.Context(), isoID)
+	if err != nil {
+		return nil, "", err
+	}
+	if iso.Status != "ready" {
+		return nil, "", fmt.Errorf("iso %d is %s (must be ready)", iso.ID, iso.Status)
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
+		scheme = p
+	}
+	host := r.Host
+	if h := r.Header.Get("X-Forwarded-Host"); h != "" {
+		host = h
+	}
+	url := fmt.Sprintf("%s://%s/iso/%d/%s", scheme, host, iso.ID, iso.Filename)
+	return iso, url, nil
+}
+
+// writeISOLookupErr maps resolveISO's failure modes to HTTP statuses.
+func (h *ServersHandler) writeISOLookupErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, db.ErrNotFound) {
+		writeError(w, "iso not found", http.StatusNotFound)
+		return
+	}
+	// Status-not-ready and "store not wired" surface as 409 and 500
+	// respectively; the string prefix differentiates.
+	writeError(w, err.Error(), http.StatusConflict)
+}
+
+// writeRedfishErr maps BMC errors to HTTP statuses — network failure
+// → 503 (try again, fix the path), everything else (auth, 4xx, 5xx
+// from the BMC) → 400 so the admin sees the actual message.
+func (h *ServersHandler) writeRedfishErr(w http.ResponseWriter, err error, ctx string) {
+	status := http.StatusBadRequest
+	if errors.As(err, new(*redfish.NetError)) {
+		status = http.StatusServiceUnavailable
+	}
+	writeError(w, ctx+": "+err.Error(), status)
+}
+
+// clientForServerID is clientForServer's sibling when the id was
+// already parsed by the caller — avoids re-parsing the URL param.
+func (h *ServersHandler) clientForServerID(w http.ResponseWriter, r *http.Request, id int64) (*redfish.Client, string, bool) {
+	srv, err := h.store.GetServer(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, "not found", http.StatusNotFound)
+			return nil, "", false
+		}
+		writeError(w, "lookup failed", http.StatusInternalServerError)
+		return nil, "", false
+	}
+	username, password, err := h.store.GetCredentials(r.Context(), id)
+	if err != nil {
+		slog.Error("clientForServerID: decrypt creds", "err", err, "id", id)
 		writeError(w, "credentials unavailable", http.StatusInternalServerError)
 		return nil, "", false
 	}

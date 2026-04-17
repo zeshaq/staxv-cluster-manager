@@ -207,7 +207,9 @@ func cmdServe(args []string) {
 		dashH.Mount(r, authMW)
 
 		// Physical servers — Redfish (iLO/iDRAC) inventory. Admin-only.
-		serversH := handlers.NewServersHandler(serverStore)
+		// Takes isoStore so mount-iso / boot-from-iso can look up the
+		// ISO row and construct the BMC-facing serve URL.
+		serversH := handlers.NewServersHandler(serverStore, isoStore)
 		serversH.Mount(r, authMW)
 	})
 

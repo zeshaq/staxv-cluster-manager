@@ -31,6 +31,20 @@ hypervisor agent.
   - `NetworkInterfaces()` — `/Systems/{id}/EthernetInterfaces`.
 - Empty slots (`capacity_mib = 0` on memory) are filtered client-side; the raw list includes them so admin CAN see "slot N empty" if they want.
 
+### Virtual Media (ISO mount via BMC)
+- `GET  /api/servers/{id}/virtual-media` — lists every slot the BMC exposes (Floppy, USB, CD, DVD) with `{id, name, media_types, inserted, image, connected_via, write_protected}`.
+- `POST /api/servers/{id}/mount-iso`  body `{iso_id, slot?}` — InsertMedia on a CD/DVD-capable slot. Slot optional → auto-picks first slot whose `MediaTypes` contains CD or DVD. Returns the refreshed slot list.
+- `POST /api/servers/{id}/eject-iso`  body `{slot}` — EjectMedia. Slot required (no sensible "eject first mounted" default when multiple slots are mounted).
+- `POST /api/servers/{id}/boot-from-iso` body `{iso_id, slot?}` — composite: InsertMedia → PATCH System `Boot.BootSourceOverrideTarget=Cd, Enabled=Once` → ComputerSystem.Reset. Reset type is `On` if the system is Off, else `ForceRestart` (graceful won't wake a halted OS that's being reinstalled). No rollback on partial failure — the error carries a "ISO mounted — eject manually if aborting" hint so the admin knows what state the box is in.
+- `pkg/redfish/virtualmedia.go`:
+  - `VirtualMedia()` — walks `/Managers/{id}` → `/VirtualMedia` collection → per-slot fan-out. Best-effort: a single broken slot is skipped, not fatal.
+  - `findVMSlot(wantID)` — resolves "", "auto-pick first CD/DVD" or exact id; used by both Insert and Eject.
+  - `InsertMedia(slot, imageURL)` — body `{Image, TransferProtocolType: HTTP|HTTPS, Inserted: true, WriteProtected: true}`. Proto derived from URL scheme. Falls back to spec-compliant action URL when the BMC under-populates `Actions.#VirtualMedia.InsertMedia.target`.
+  - `EjectMedia(slot)` — POSTs `{}` (empty object, not nil — some BMCs 400 on nil bodies).
+  - `SetBootOverride(target, enabled)` — PATCH on the first System with `If-Match: *` header (iLO requires it).
+- BMC-facing ISO URL is built from the admin's request: `<scheme>://<host>/iso/{iso_id}/{filename}`. Honors `X-Forwarded-Proto` / `X-Forwarded-Host` when present (reverse-proxy-safe). Assumes the admin's browser and the BMC both reach the CM at the same URL — documented limitation; a future `[isos] serve_base_url` knob would cover split-network deployments.
+- Frontend: lazy-loaded "Virtual media" expandable section on ServerDetail. Shows slot table with state (Inserted/Empty + current Image URL + ConnectedVia). Two top-level actions: **Mount ISO…** (mounts only) and **Boot from ISO…** (mount + boot override + reset, with restart warning). Both open a shared `ISOPicker` modal that fetches `/api/isos` filtered to `status=ready`. Per-slot Eject button appears when `inserted=true`. Buttons disable when the BMC exposes no CD/DVD-capable slot.
+
 ### Thermal + power sensors (commit 5a16c32)
 - `GET /api/servers/{id}/health` — fans, temperature probes, PSUs, live power consumption.
 - `pkg/redfish/health.go`:
@@ -66,7 +80,6 @@ lazy-load-on-expand UX; don't preload.
 
 Each its own follow-up commit:
 
-- **Boot media attach (Virtual Media)** — next obvious step, wires to the new `/iso/{id}/{filename}` serve URL. Redfish `VirtualMedia.InsertMedia` with Image URL. Adds "Boot from ISO" button on server detail.
 - Firmware inventory + BIOS/iLO/iDRAC update workflows.
 - Serial-over-LAN console proxy via Redfish.
 - OEM extensions (HPE iLO `/Oem/Hpe/*`, Dell iDRAC `/Oem/Dell/*`) — only if we hit something the spec doesn't cover.
