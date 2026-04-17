@@ -211,6 +211,18 @@ func (h *NetworkDevicesHandler) Test(w http.ResponseWriter, r *http.Request) {
 	if err := h.store.UpdateReachability(r.Context(), id, probe); err != nil {
 		slog.Warn("network-devices test: update reachability", "err", err, "id", id)
 	}
+	// Autodetect role from the probed model — same pattern as Create.
+	// SetRoleIfUnknown only fires when role is literally 'unknown', so
+	// manual admin overrides stick. Covers the stuck-at-unknown rows
+	// that got enrolled before Phase 1.5 (role) shipped: a single
+	// Refresh click after deploy classifies them.
+	if probe.OK && probe.Model != "" {
+		if auto := cisco.DetectRole(probe.Model); auto != cisco.RoleUnknown {
+			if err := h.store.SetRoleIfUnknown(r.Context(), id, auto); err != nil {
+				slog.Warn("network-devices test: autodetect role", "err", err, "id", id)
+			}
+		}
+	}
 	fresh, err := h.store.GetNetworkDevice(r.Context(), id)
 	if err != nil {
 		writeError(w, "refetch failed", http.StatusInternalServerError)
