@@ -210,12 +210,14 @@ func (h *ServersHandler) probe(ctx context.Context, _id int64, host string, port
 		}
 	}
 	r := &db.ProbeResult{OK: false, Err: truncateErr(err, 256)}
-	switch err.(type) {
-	case *redfish.NetError:
+	// errors.As walks the %w wrap chain (the redfish package surfaces
+	// typed errors inside fmt.Errorf("service root: %w", err)).
+	var netErr *redfish.NetError
+	if errors.As(err, &netErr) {
 		r.Status = "unreachable"
-	default:
-		// AuthError, HTTPError, JSON decode errors, etc. — not a
-		// network failure, but something logically wrong.
+	} else {
+		// AuthError, HTTPError, JSON decode errors — reached the box
+		// but something's logically wrong.
 		r.Status = "error"
 	}
 	// A partial success (info populated but err set) falls through as
