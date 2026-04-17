@@ -10,7 +10,7 @@ features to come.
 staxv-cluster-manager/
 ├── go.mod                  — module: github.com/zeshaq/staxv-cluster-manager
 ├── cmd/staxv-cluster-manager/main.go
-│                              subcommands: serve, useradd, migrate, version
+│                              subcommands: serve, useradd, network-add, migrate, version
 ├── internal/
 │   ├── config/config.go   — TOML loader
 │   ├── db/                — SQLite, migrations (0001_users, 0002_settings)

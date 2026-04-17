@@ -17,6 +17,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -38,6 +39,7 @@ import (
 	"github.com/zeshaq/staxv-cluster-manager/internal/isolib"
 	"github.com/zeshaq/staxv-cluster-manager/internal/webui"
 	"github.com/zeshaq/staxv-cluster-manager/pkg/auth"
+	"github.com/zeshaq/staxv-cluster-manager/pkg/cisco"
 	"github.com/zeshaq/staxv-cluster-manager/pkg/pamauth"
 	"github.com/zeshaq/staxv-cluster-manager/pkg/secrets"
 	"golang.org/x/term"
@@ -57,6 +59,8 @@ func main() {
 		cmdServe(args)
 	case "useradd":
 		cmdUseradd(args)
+	case "network-add":
+		cmdNetworkAdd(args)
 	case "migrate":
 		cmdMigrate(args)
 	case "version", "-v", "--version":
@@ -77,11 +81,12 @@ Usage:
   staxv-cluster-manager <command> [flags]
 
 Commands:
-  serve      Run the HTTP server
-  useradd    Create an admin user (DB or --link-existing for PAM)
-  migrate    Apply pending SQLite migrations
-  version    Print version
-  help       Show this help
+  serve        Run the HTTP server
+  useradd      Create an admin user (DB or --link-existing for PAM)
+  network-add  Enroll a Cisco IOS / IOS-XE device (offline DB insert)
+  migrate      Apply pending SQLite migrations
+  version      Print version
+  help         Show this help
 
 Use "staxv-cluster-manager <command> -h" for command-specific flags.
 
@@ -160,6 +165,7 @@ func cmdServe(args []string) {
 	}
 	settingsStore := db.NewSettingsStore(store, aead)
 	serverStore := db.NewServerStore(store, aead)
+	networkDeviceStore := db.NewNetworkDeviceStore(store, aead)
 	isoStore := db.NewISOStore(store)
 
 	// ISO library root. Created 0755 on first boot so fresh clones
@@ -211,6 +217,12 @@ func cmdServe(args []string) {
 		// ISO row and construct the BMC-facing serve URL.
 		serversH := handlers.NewServersHandler(serverStore, isoStore)
 		serversH.Mount(r, authMW)
+
+		// Network devices — Cisco IOS / IOS-XE switches & routers via
+		// SSH. Phase 1: CRUD + probe + health. Admin-only (fabric
+		// creds are root-equivalent on the wire side of the fleet).
+		networkH := handlers.NewNetworkDevicesHandler(networkDeviceStore)
+		networkH.Mount(r, authMW)
 	})
 
 	// ISO library — both authenticated /api/isos/* (admin-only) AND the
@@ -406,6 +418,157 @@ func promptPassword() string {
 		os.Exit(2)
 	}
 	return pw
+}
+
+// -----------------------------------------------------------------------
+// network-add — offline enrollment of a Cisco IOS / IOS-XE device.
+// -----------------------------------------------------------------------
+//
+// Bulk import without needing the HTTP server running or an auth
+// cookie. Writes the row directly to SQLite with creds encrypted by
+// the same pkg/secrets AEAD the server uses.
+//
+// Example:
+//
+//	staxv-cluster-manager network-add \
+//	  --config /etc/staxv-cluster-manager/config.toml \
+//	  --name core-router --host 192.168.111.1 \
+//	  --username admin --password admin
+//
+// Status is set to 'unknown' on insert — admin picks it up via the
+// UI's Refresh button (or POST /api/network-devices/{id}/test) to
+// drive the SSH probe. Pass --probe to run the probe synchronously
+// from the CLI; useful when you're on the mgmt network and want
+// reachability feedback in the same breath as the insert.
+
+func cmdNetworkAdd(args []string) {
+	fs := flag.NewFlagSet("network-add", flag.ExitOnError)
+	configPath := fs.String("config", "/etc/staxv-cluster-manager/config.toml", "path to TOML config file")
+	name := fs.String("name", "", "admin-chosen unique name (required)")
+	host := fs.String("host", "", "management IP or hostname (required)")
+	port := fs.Int("port", 22, "SSH port")
+	username := fs.String("username", "", "SSH username (required)")
+	password := fs.String("password", "", "SSH password (required; use '-' to read from stdin)")
+	enable := fs.String("enable", "", "enable secret (optional; empty = priv-15 on login)")
+	platform := fs.String("platform", "", "platform override: ios | ios-xe | nxos (empty = autodetect on probe)")
+	probe := fs.Bool("probe", false, "SSH to the device after insert, run `show version`, update reachability")
+	_ = fs.Parse(args)
+
+	if *name == "" || *host == "" || *username == "" || *password == "" {
+		fmt.Fprintln(os.Stderr, "network-add: --name, --host, --username, --password are required")
+		os.Exit(2)
+	}
+
+	// Allow --password - to read from stdin so scripts can pipe
+	// without the password showing in `ps auxf` or shell history.
+	if *password == "-" {
+		reader := bufio.NewReader(os.Stdin)
+		line, err := reader.ReadString('\n')
+		if err != nil && err.Error() != "EOF" {
+			fmt.Fprintf(os.Stderr, "read password from stdin: %v\n", err)
+			os.Exit(1)
+		}
+		*password = strings.TrimRight(line, "\r\n")
+		if *password == "" {
+			fmt.Fprintln(os.Stderr, "network-add: empty password on stdin")
+			os.Exit(2)
+		}
+	}
+
+	cfg := mustLoadConfig(*configPath)
+	initLogger(cfg.Log.Level)
+	ctx := context.Background()
+
+	store, err := db.Open(ctx, cfg.DB.Path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "network-add: open db: %v\n", err)
+		os.Exit(1)
+	}
+	defer store.Close()
+
+	// Same AEAD the server uses — keeps the row decryptable by serve.
+	encKey, err := secrets.LoadOrCreateKey(cfg.Secrets.KeyPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "network-add: load/create encryption key: %v\n", err)
+		os.Exit(1)
+	}
+	aead, err := secrets.NewAEAD(encKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "network-add: init AEAD: %v\n", err)
+		os.Exit(1)
+	}
+
+	ndStore := db.NewNetworkDeviceStore(store, aead)
+	dev, err := ndStore.CreateNetworkDevice(ctx, db.CreateNetworkDeviceArgs{
+		Name:           *name,
+		MgmtHost:       *host,
+		MgmtPort:       *port,
+		Username:       *username,
+		Password:       *password,
+		EnablePassword: *enable,
+		Platform:       *platform,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			fmt.Fprintf(os.Stderr, "network-add: device %q already exists (by name)\n", *name)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "network-add: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("enrolled network device %q (id=%d, host=%s:%d, platform=%s)\n",
+		dev.Name, dev.ID, dev.MgmtHost, dev.MgmtPort, dev.Platform)
+
+	if !*probe {
+		fmt.Println("  → status=unknown; probe via UI Refresh or POST /api/network-devices/{id}/test")
+		return
+	}
+
+	// Inline probe — best-effort; caller still gets an exit 0 since
+	// the row IS in the DB. Print the outcome so the CLI is useful.
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	fmt.Printf("  → probing over SSH (timeout 30s)... ")
+	cli, err := cisco.Dial(probeCtx, dev.MgmtHost, dev.MgmtPort, *username, *password, *enable)
+	if err != nil {
+		r := &db.NetworkDeviceProbeResult{OK: false, Err: err.Error(), Status: "error"}
+		var de *cisco.DialError
+		if errors.As(err, &de) {
+			r.Status = "unreachable"
+		}
+		_ = ndStore.UpdateReachability(ctx, dev.ID, r)
+		fmt.Printf("failed: %v\n", err)
+		return
+	}
+	defer cli.Close()
+
+	info, err := cli.Probe(probeCtx)
+	if err != nil {
+		_ = ndStore.UpdateReachability(ctx, dev.ID, &db.NetworkDeviceProbeResult{
+			OK: false, Err: err.Error(), Status: "error",
+		})
+		fmt.Printf("reached, but `show version` parse failed: %v\n", err)
+		return
+	}
+	_ = ndStore.UpdateReachability(ctx, dev.ID, &db.NetworkDeviceProbeResult{
+		OK:       true,
+		Platform: info.Platform,
+		Model:    info.Model,
+		Version:  info.Version,
+		Serial:   info.Serial,
+		Hostname: info.Hostname,
+		UptimeS:  info.UptimeS,
+	})
+	fmt.Printf("reachable (hostname=%s, model=%s, ios=%s)\n",
+		nonEmpty(info.Hostname, "?"), nonEmpty(info.Model, "?"), nonEmpty(info.Version, "?"))
+}
+
+func nonEmpty(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 // -----------------------------------------------------------------------

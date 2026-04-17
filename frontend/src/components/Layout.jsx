@@ -2,7 +2,7 @@ import { Link, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
 import {
   LayoutDashboard, Server, Users, Settings as SettingsIcon,
-  LogOut, Activity, HardDrive, Disc3,
+  LogOut, Activity, HardDrive, Disc3, Router,
 } from 'lucide-react'
 import api from '../api'
 
@@ -15,6 +15,7 @@ import api from '../api'
 const NAV = [
   { to: '/',         label: 'Overview', icon: LayoutDashboard }, // cluster-wide snapshot
   { to: '/servers',  label: 'Servers',  icon: HardDrive },       // physical servers (iLO / iDRAC)
+  { to: '/network',  label: 'Network',  icon: Router },          // Cisco switches/routers (SSH)
   { to: '/fleet',    label: 'Fleet',    icon: Server },           // enrolled hypervisors
   { to: '/isos',     label: 'ISOs',     icon: Disc3 },            // install-media library for BMC Virtual Media
   { to: '/users',    label: 'Users',    icon: Users },            // fleet-level user directory

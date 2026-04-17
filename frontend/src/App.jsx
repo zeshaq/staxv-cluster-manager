@@ -6,6 +6,8 @@ import Login from './pages/Login'
 import Home from './pages/Home'
 import Servers from './pages/Servers'
 import ServerDetail from './pages/ServerDetail'
+import Network from './pages/Network'
+import NetworkDeviceDetail from './pages/NetworkDeviceDetail'
 import Fleet from './pages/Fleet'
 import ISOs from './pages/ISOs'
 import Users from './pages/Users'
@@ -55,6 +57,8 @@ export default function App() {
                 <Route path="/"          element={<Home />} />
                 <Route path="/servers"        element={<Servers />} />
                 <Route path="/servers/:id"    element={<ServerDetail />} />
+                <Route path="/network"        element={<Network />} />
+                <Route path="/network/:id"    element={<NetworkDeviceDetail />} />
                 <Route path="/fleet"     element={<Fleet />} />
                 <Route path="/isos"      element={<ISOs />} />
                 <Route path="/users"     element={<Users />} />
