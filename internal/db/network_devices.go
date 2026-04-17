@@ -25,6 +25,7 @@ type NetworkDevice struct {
 	Username   string     `json:"username"`
 	HasEnable  bool       `json:"has_enable"` // derived — never return the password itself
 	Platform   string     `json:"platform"`   // "ios" | "ios-xe" | "nxos"
+	Role       string     `json:"role"`       // router | switch | l3-switch | firewall | other | unknown
 	Status     string     `json:"status"`     // unknown | reachable | unreachable | error
 	StatusErr  string     `json:"status_error,omitempty"`
 	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
@@ -53,7 +54,7 @@ func NewNetworkDeviceStore(db *DB, enc *secrets.AEAD) *NetworkDeviceStore {
 const networkDeviceColumns = `
 	id, name, mgmt_host, mgmt_port, username,
 	enable_password_enc IS NOT NULL AS has_enable,
-	platform,
+	platform, role,
 	status, status_error, last_seen_at,
 	model, version, serial, hostname, uptime_s,
 	created_at, updated_at
@@ -69,7 +70,7 @@ func scanNetworkDevice(row interface{ Scan(...any) error }) (*NetworkDevice, err
 	err := row.Scan(
 		&d.ID, &d.Name, &d.MgmtHost, &d.MgmtPort, &d.Username,
 		&d.HasEnable,
-		&d.Platform,
+		&d.Platform, &d.Role,
 		&d.Status, &statusErr, &lastSeen,
 		&model, &version, &serial, &hostname, &uptime,
 		&d.CreatedAt, &d.UpdatedAt,
@@ -104,6 +105,11 @@ type CreateNetworkDeviceArgs struct {
 	Password       string // required; encrypted before write
 	EnablePassword string // optional; NULL in DB if empty
 	Platform       string // empty → "ios" default
+	// Role defaults to "unknown" when empty — the enrollment handler
+	// autodetects from the model string after a successful probe and
+	// flips this to "router" / "switch" / "l3-switch" as appropriate.
+	// Admin can always override via UpdateRole.
+	Role string
 }
 
 func (s *NetworkDeviceStore) CreateNetworkDevice(ctx context.Context, a CreateNetworkDeviceArgs) (*NetworkDevice, error) {
@@ -112,6 +118,9 @@ func (s *NetworkDeviceStore) CreateNetworkDevice(ctx context.Context, a CreateNe
 	}
 	if a.Platform == "" {
 		a.Platform = "ios"
+	}
+	if a.Role == "" {
+		a.Role = "unknown"
 	}
 	encPw, err := s.enc.Encrypt([]byte(a.Password))
 	if err != nil {
@@ -129,9 +138,11 @@ func (s *NetworkDeviceStore) CreateNetworkDevice(ctx context.Context, a CreateNe
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO network_devices (name, mgmt_host, mgmt_port, username,
 		                             password_enc, enable_password_enc,
-		                             platform, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?)
-	`, a.Name, a.MgmtHost, a.MgmtPort, a.Username, encPw, encEnable, a.Platform, now, now)
+		                             platform, role, status,
+		                             created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?)
+	`, a.Name, a.MgmtHost, a.MgmtPort, a.Username, encPw, encEnable,
+		a.Platform, a.Role, now, now)
 	if err != nil {
 		return nil, err
 	}
@@ -193,6 +204,35 @@ func (s *NetworkDeviceStore) ListNetworkDevices(ctx context.Context) ([]NetworkD
 
 func (s *NetworkDeviceStore) DeleteNetworkDevice(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM network_devices WHERE id = ?`, id)
+	return err
+}
+
+// UpdateRole sets the role explicitly. Used by both the admin override
+// (POST /network-devices/{id}/role) and the post-probe autodetect at
+// enrollment.
+//
+// Valid values are validated at the handler layer — this store method
+// writes whatever it's given, on the theory that DB methods don't do
+// semantic validation (same reason we don't CHECK CONSTRAINT the enum
+// in SQL).
+func (s *NetworkDeviceStore) UpdateRole(ctx context.Context, id int64, role string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE network_devices SET role = ?, updated_at = ? WHERE id = ?
+	`, role, time.Now(), id)
+	return err
+}
+
+// SetRoleIfUnknown is the enrollment-time autodetect path. Only
+// overwrites role when it's still 'unknown' — admin overrides stick
+// because their role is no longer 'unknown' after the POST /role
+// call. If admin wants to re-run autodetect, they can POST role=unknown
+// and re-enroll / re-probe (deferred: a /redetect endpoint).
+func (s *NetworkDeviceStore) SetRoleIfUnknown(ctx context.Context, id int64, role string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE network_devices
+		SET role = ?, updated_at = ?
+		WHERE id = ? AND role = 'unknown'
+	`, role, time.Now(), id)
 	return err
 }
 

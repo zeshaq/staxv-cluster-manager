@@ -5,6 +5,7 @@ import {
   Eye, EyeOff, ChevronRight,
 } from 'lucide-react'
 import api from '../api'
+import { ROLES, roleMeta } from './networkRoles'
 
 // Network page — Cisco IOS / IOS-XE switches + routers managed over
 // SSH. Shape deliberately mirrors Servers.jsx so users switching
@@ -15,6 +16,18 @@ import api from '../api'
 // Duplicated with Servers.jsx (intentional: lets each page evolve
 // independently without a shared-component coupling).
 // ──────────────────────────────────────────────────────────────
+// Role badge — small, icon + label. Color from the role metadata so
+// router/switch/l3-switch read at a glance.
+function RoleBadge({ role }) {
+  const m = roleMeta(role)
+  const Icon = m.icon
+  return (
+    <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-${m.color}-500/10 text-${m.color}-300 ring-1 ring-${m.color}-500/30 text-[11px] font-medium`}>
+      <Icon size={11} /> {m.label}
+    </span>
+  )
+}
+
 function StatusBadge({ status }) {
   const variants = {
     reachable:   { icon: CheckCircle, text: 'text-lime-300',  bg: 'bg-lime-500/10',  ring: 'ring-lime-500/30',  label: 'Reachable' },
@@ -40,7 +53,7 @@ function EnrollPanel({ open, onClose, onEnrolled }) {
   const [form, setForm] = useState({
     name: '', mgmt_host: '', mgmt_port: '22',
     username: '', password: '', enable_password: '',
-    platform: '',
+    platform: '', role: '',
   })
   const [showPass, setShowPass] = useState(false)
   const [showEnable, setShowEnable] = useState(false)
@@ -56,14 +69,15 @@ function EnrollPanel({ open, onClose, onEnrolled }) {
     setErr(''); setLoading(true)
     try {
       const body = { ...form, mgmt_port: parseInt(form.mgmt_port, 10) || 22 }
-      // Don't send empty platform — let backend default to "ios".
+      // Don't send empty fields — let backend default them.
       if (!body.platform) delete body.platform
       if (!body.enable_password) delete body.enable_password
+      if (!body.role) delete body.role
       await api.post('/network-devices', body)
       setForm({
         name: '', mgmt_host: '', mgmt_port: '22',
         username: '', password: '', enable_password: '',
-        platform: '',
+        platform: '', role: '',
       })
       onEnrolled(); onClose()
     } catch (e) {
@@ -150,21 +164,38 @@ function EnrollPanel({ open, onClose, onEnrolled }) {
           </button>
         </div>
         {showAdvanced && (
-          <div className="md:col-span-2">
-            <label className="block text-[11px] font-semibold tracking-wider uppercase text-slate-400 mb-1.5">
-              Platform <span className="text-slate-600 font-normal">(leave blank to autodetect from show version)</span>
-            </label>
-            <select
-              value={form.platform}
-              onChange={e => set('platform', e.target.value)}
-              className="w-full bg-canvas-900 border border-canvas-500 focus:border-brand-500 text-slate-100 rounded px-3 py-2 text-sm focus:outline-none"
-            >
-              <option value="">Autodetect</option>
-              <option value="ios">Cisco IOS (classic)</option>
-              <option value="ios-xe">Cisco IOS-XE</option>
-              <option value="nxos">Cisco NX-OS</option>
-            </select>
-          </div>
+          <>
+            <div>
+              <label className="block text-[11px] font-semibold tracking-wider uppercase text-slate-400 mb-1.5">
+                Platform <span className="text-slate-600 font-normal">(blank = autodetect)</span>
+              </label>
+              <select
+                value={form.platform}
+                onChange={e => set('platform', e.target.value)}
+                className="w-full bg-canvas-900 border border-canvas-500 focus:border-brand-500 text-slate-100 rounded px-3 py-2 text-sm focus:outline-none"
+              >
+                <option value="">Autodetect</option>
+                <option value="ios">Cisco IOS (classic)</option>
+                <option value="ios-xe">Cisco IOS-XE</option>
+                <option value="nxos">Cisco NX-OS</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-[11px] font-semibold tracking-wider uppercase text-slate-400 mb-1.5">
+                Role <span className="text-slate-600 font-normal">(blank = autodetect from model)</span>
+              </label>
+              <select
+                value={form.role}
+                onChange={e => set('role', e.target.value)}
+                className="w-full bg-canvas-900 border border-canvas-500 focus:border-brand-500 text-slate-100 rounded px-3 py-2 text-sm focus:outline-none"
+              >
+                <option value="">Autodetect</option>
+                {ROLES.filter(r => r.value !== 'unknown').map(r => (
+                  <option key={r.value} value={r.value}>{r.label}</option>
+                ))}
+              </select>
+            </div>
+          </>
         )}
 
         <div className="md:col-span-2 flex items-center justify-end gap-2 pt-2">
@@ -249,7 +280,10 @@ function DeviceCard({ device, onChanged }) {
             </div>
           </div>
         </Link>
-        <StatusBadge status={device.status} />
+        <div className="flex items-center gap-1.5 flex-wrap justify-end">
+          <RoleBadge role={device.role} />
+          <StatusBadge status={device.status} />
+        </div>
       </div>
 
       {(device.model || device.version || device.serial || device.hostname) && (
@@ -308,6 +342,7 @@ export default function Network() {
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
   const [enrolling, setEnrolling] = useState(false)
+  const [roleFilter, setRoleFilter] = useState('all')
 
   const fetchAll = () => {
     setLoading(true)
@@ -317,6 +352,23 @@ export default function Network() {
       .finally(() => setLoading(false))
   }
   useEffect(fetchAll, [])
+
+  // Filter tabs are dynamic — only show ones that have at least one
+  // device (plus "All"). Keeps the bar from cluttering with empty
+  // "Firewalls" / "Unknown" tabs when the fleet doesn't have any.
+  const roleCounts = devices.reduce((acc, d) => {
+    acc[d.role || 'unknown'] = (acc[d.role || 'unknown'] || 0) + 1
+    return acc
+  }, {})
+  const activeTabs = [
+    { value: 'all', short: 'All', count: devices.length },
+    ...ROLES.filter(r => roleCounts[r.value] > 0).map(r => ({
+      ...r, count: roleCounts[r.value],
+    })),
+  ]
+  const filtered = roleFilter === 'all'
+    ? devices
+    : devices.filter(d => (d.role || 'unknown') === roleFilter)
 
   return (
     <div className="max-w-7xl mx-auto space-y-5">
@@ -341,6 +393,31 @@ export default function Network() {
         <div className="bg-red-900/40 border border-red-700/50 text-red-300 text-sm rounded-md px-4 py-3">{err}</div>
       )}
 
+      {/* Role filter bar. Hidden when there are no devices yet. */}
+      {devices.length > 0 && activeTabs.length > 2 && (
+        <div className="flex items-center gap-1 flex-wrap border-b border-canvas-500">
+          {activeTabs.map(t => {
+            const active = roleFilter === t.value
+            const Icon = t.icon
+            return (
+              <button
+                key={t.value}
+                onClick={() => setRoleFilter(t.value)}
+                className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+                  active
+                    ? 'text-brand-300 border-brand-500'
+                    : 'text-slate-500 border-transparent hover:text-slate-300'
+                }`}
+              >
+                {Icon && <Icon size={12} />}
+                {t.short}
+                <span className="text-[10px] text-slate-500 font-mono">{t.count}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+
       {loading ? (
         <div className="text-brand-400 text-center py-12">Loading…</div>
       ) : devices.length === 0 && !enrolling ? (
@@ -359,9 +436,16 @@ export default function Network() {
           </button>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {devices.map(d => <DeviceCard key={d.id} device={d} onChanged={fetchAll} />)}
-        </div>
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filtered.map(d => <DeviceCard key={d.id} device={d} onChanged={fetchAll} />)}
+          </div>
+          {filtered.length === 0 && devices.length > 0 && (
+            <div className="text-slate-500 text-sm text-center py-8 italic">
+              No devices in this role. Adjust the filter above.
+            </div>
+          )}
+        </>
       )}
     </div>
   )

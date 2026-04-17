@@ -45,6 +45,7 @@ func (h *NetworkDevicesHandler) Mount(r chi.Router, authMW func(http.Handler) ht
 		r.Delete("/{id}", h.Delete)
 		r.Post("/{id}/test", h.Test)
 		r.Get("/{id}/health", h.Health)
+		r.Post("/{id}/role", h.SetRole)
 	})
 }
 
@@ -56,6 +57,9 @@ type enrollNetworkDeviceRequest struct {
 	Password       string `json:"password"`
 	EnablePassword string `json:"enable_password,omitempty"`
 	Platform       string `json:"platform,omitempty"` // "ios" default; "ios-xe" / "nxos" override
+	// Role override — optional. Empty string = leave as 'unknown' and
+	// let the post-probe autodetect classify it from the model string.
+	Role string `json:"role,omitempty"`
 }
 
 func (h *NetworkDevicesHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -88,6 +92,12 @@ func (h *NetworkDevicesHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "name, mgmt_host, username, password are required", http.StatusBadRequest)
 		return
 	}
+	// Role override is optional; validate if supplied. Empty = leave
+	// as 'unknown' so the post-probe autodetect classifies it below.
+	if req.Role != "" && !cisco.ValidRoles[req.Role] {
+		writeError(w, "invalid role: "+req.Role+" (valid: router, switch, l3-switch, firewall, other, unknown)", http.StatusBadRequest)
+		return
+	}
 
 	dev, err := h.store.CreateNetworkDevice(r.Context(), db.CreateNetworkDeviceArgs{
 		Name:           req.Name,
@@ -97,6 +107,7 @@ func (h *NetworkDevicesHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Password:       req.Password,
 		EnablePassword: req.EnablePassword,
 		Platform:       req.Platform,
+		Role:           req.Role,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -111,6 +122,16 @@ func (h *NetworkDevicesHandler) Create(w http.ResponseWriter, r *http.Request) {
 	probe := h.probe(r.Context(), req.MgmtHost, req.MgmtPort, req.Username, req.Password, req.EnablePassword)
 	if err := h.store.UpdateReachability(r.Context(), dev.ID, probe); err != nil {
 		slog.Warn("network-devices create: update reachability", "err", err, "id", dev.ID)
+	}
+	// Autodetect role from the probed model — only if admin didn't
+	// pre-pick one and the probe actually succeeded with a model. Uses
+	// SetRoleIfUnknown so manual overrides via POST /role are sticky.
+	if probe.OK && probe.Model != "" {
+		if auto := cisco.DetectRole(probe.Model); auto != cisco.RoleUnknown {
+			if err := h.store.SetRoleIfUnknown(r.Context(), dev.ID, auto); err != nil {
+				slog.Warn("network-devices create: autodetect role", "err", err, "id", dev.ID)
+			}
+		}
 	}
 	fresh, err := h.store.GetNetworkDevice(r.Context(), dev.ID)
 	if err != nil {
@@ -234,6 +255,49 @@ func (h *NetworkDevicesHandler) Health(w http.ResponseWriter, r *http.Request) {
 		"interfaces", len(health.Interfaces),
 	)
 	writeJSON(w, http.StatusOK, health)
+}
+
+// SetRole is the admin-override path for the operational role
+// (router / switch / l3-switch / firewall / other / unknown).
+// Once set manually, the enrollment-time autodetect won't overwrite
+// it — SetRoleIfUnknown (which runs at enroll) only fires when the
+// row is still 'unknown'.
+//
+// Body: {"role": "<role>"}. Reject unknown values with 400 so the
+// UI surfaces a useful error rather than silently accepting garbage.
+func (h *NetworkDevicesHandler) SetRole(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseInt64Param(w, r, "id")
+	if !ok {
+		return
+	}
+	var req struct {
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid body (expected {\"role\":\"...\"})", http.StatusBadRequest)
+		return
+	}
+	req.Role = strings.TrimSpace(req.Role)
+	if !cisco.ValidRoles[req.Role] {
+		writeError(w, "invalid role: "+req.Role+" (valid: router, switch, l3-switch, firewall, other, unknown)", http.StatusBadRequest)
+		return
+	}
+	if err := h.store.UpdateRole(r.Context(), id, req.Role); err != nil {
+		slog.Error("network-devices set role", "err", err, "id", id)
+		writeError(w, "update failed", http.StatusInternalServerError)
+		return
+	}
+	fresh, err := h.store.GetNetworkDevice(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, "not found", http.StatusNotFound)
+			return
+		}
+		writeError(w, "refetch failed", http.StatusInternalServerError)
+		return
+	}
+	slog.Info("network device role updated", "id", id, "name", fresh.Name, "role", req.Role)
+	writeJSON(w, http.StatusOK, fresh)
 }
 
 // probe opens a short-lived SSH session, runs `show version`, and

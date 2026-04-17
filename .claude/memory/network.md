@@ -32,6 +32,48 @@ Deferred for Phase 2/3 (planned; tracked below).
 - Partial-failure-friendly: each block has its own `*_error` field in the JSON so the UI renders usable data alongside per-block errors.
 - ~2-4s end-to-end on a warm mgmt connection; UI lazy-loads on expand.
 
+### Role classification (Phase 1.5)
+
+Rather than splitting the table into routers + switches, one
+`network_devices` table with a `role` column. Cisco itself blurs
+the line (L3 switches speak both languages); separate tables would
+force an awkward classification at enroll time and duplicate 80%+
+of the SSH plumbing.
+
+Enum (validated at the handler layer; no SQL CHECK constraint):
+
+| Value       | Devices                                          |
+|-------------|--------------------------------------------------|
+| `router`    | ISR / ASR / C8xxx / classic 19xx-39xx / RV       |
+| `l3-switch` | C3xxx / C9300 / C9400 / C9500 / Nexus            |
+| `switch`    | C2960 / C9200(L) / SG / SF                       |
+| `firewall`  | ASA / Firepower (no handler support yet)         |
+| `other`     | Admin-picked escape hatch                        |
+| `unknown`   | Default until autodetect or admin sets it        |
+
+- **Autodetect** at enrollment only — `pkg/cisco.DetectRole(model)`
+  runs after the probe returns `show version`'s parsed model string.
+  Uses prefix match + a regex for the 1900/2900/3900 ISR G2 family
+  (`[123]9\d{2}(/K9)?`). Unit-tested in `pkg/cisco/role_test.go`;
+  new SKUs land as new cases + detection updates.
+- **Admin override** via `POST /api/network-devices/{id}/role` body
+  `{"role": "..."}`. Sticky — `SetRoleIfUnknown` is the enrollment-
+  path write, so subsequent re-probes don't clobber an admin pick.
+  To re-run autodetect, admin sets role=unknown and re-enrolls /
+  probes (a dedicated `/redetect` endpoint is a follow-up if needed).
+- **Frontend** — role badge on every card (icon + color per role),
+  filter bar on the list page (`All · Routers · L3 switches ·
+  Switches · …`) that only shows tabs for roles actually present in
+  the fleet. Detail page has an inline-edit dropdown in the header
+  + in the Identification section.
+- **Phase 2/3 scoping** — the VLAN editor will be visible on
+  `switch` + `l3-switch`; the interface-IP editor on `router` +
+  `l3-switch`; the routing-table viewer (later) on `router` +
+  `l3-switch`. Keeps feature surfaces appropriate per device class.
+
+Migration: `0007_network_device_role.sql` — `ADD COLUMN role TEXT
+NOT NULL DEFAULT 'unknown'` + index.
+
 ### Offline bulk enrollment (CLI)
 
 `staxv-cluster-manager network-add` — inserts a device directly into

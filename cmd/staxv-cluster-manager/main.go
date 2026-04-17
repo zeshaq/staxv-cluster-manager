@@ -451,11 +451,16 @@ func cmdNetworkAdd(args []string) {
 	password := fs.String("password", "", "SSH password (required; use '-' to read from stdin)")
 	enable := fs.String("enable", "", "enable secret (optional; empty = priv-15 on login)")
 	platform := fs.String("platform", "", "platform override: ios | ios-xe | nxos (empty = autodetect on probe)")
-	probe := fs.Bool("probe", false, "SSH to the device after insert, run `show version`, update reachability")
+	role := fs.String("role", "", "role override: router | switch | l3-switch | firewall | other (empty = autodetect from model when --probe is set)")
+	probe := fs.Bool("probe", false, "SSH to the device after insert, run `show version`, update reachability, autodetect role if not set")
 	_ = fs.Parse(args)
 
 	if *name == "" || *host == "" || *username == "" || *password == "" {
 		fmt.Fprintln(os.Stderr, "network-add: --name, --host, --username, --password are required")
+		os.Exit(2)
+	}
+	if *role != "" && !cisco.ValidRoles[*role] {
+		fmt.Fprintf(os.Stderr, "network-add: invalid --role=%q (valid: router, switch, l3-switch, firewall, other, unknown)\n", *role)
 		os.Exit(2)
 	}
 
@@ -507,6 +512,7 @@ func cmdNetworkAdd(args []string) {
 		Password:       *password,
 		EnablePassword: *enable,
 		Platform:       *platform,
+		Role:           *role,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -560,8 +566,18 @@ func cmdNetworkAdd(args []string) {
 		Hostname: info.Hostname,
 		UptimeS:  info.UptimeS,
 	})
-	fmt.Printf("reachable (hostname=%s, model=%s, ios=%s)\n",
-		nonEmpty(info.Hostname, "?"), nonEmpty(info.Model, "?"), nonEmpty(info.Version, "?"))
+	// Autodetect role from the probed model when the admin didn't
+	// pre-pick one. SetRoleIfUnknown means a prior admin override
+	// (or a future re-enroll with explicit --role) stays sticky.
+	detectedRole := cisco.RoleUnknown
+	if info.Model != "" {
+		detectedRole = cisco.DetectRole(info.Model)
+		if detectedRole != cisco.RoleUnknown {
+			_ = ndStore.SetRoleIfUnknown(ctx, dev.ID, detectedRole)
+		}
+	}
+	fmt.Printf("reachable (hostname=%s, model=%s, ios=%s, role=%s)\n",
+		nonEmpty(info.Hostname, "?"), nonEmpty(info.Model, "?"), nonEmpty(info.Version, "?"), detectedRole)
 }
 
 func nonEmpty(s, fallback string) string {

@@ -7,11 +7,55 @@ import {
   Thermometer, Key, Gauge, Activity,
 } from 'lucide-react'
 import api from '../api'
+import { ROLES, roleMeta } from './networkRoles'
 
 // Network device detail — sibling to ServerDetail but SSH-native.
 // Shows identity, reachability, live health (CPU/mem/env/interfaces).
 // VLAN + per-interface IP editors will land in Phase 2/3; this page
 // leaves room for those sections.
+
+// RoleSelector — badge + inline-edit dropdown. Clicking the badge
+// reveals the select; change fires a POST /role, then parent state
+// updates. Kept self-contained; parent passes device + onUpdated.
+function RoleSelector({ role, onChange }) {
+  const [editing, setEditing] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const m = roleMeta(role)
+  const Icon = m.icon
+
+  const change = async (e) => {
+    const next = e.target.value
+    if (next === role) { setEditing(false); return }
+    setBusy(true)
+    try { await onChange(next) } finally { setBusy(false); setEditing(false) }
+  }
+
+  if (editing) {
+    return (
+      <select
+        autoFocus
+        defaultValue={role}
+        onChange={change}
+        onBlur={() => setEditing(false)}
+        disabled={busy}
+        className="bg-canvas-700 border border-brand-500/60 text-slate-100 rounded px-2 py-0.5 text-[11px] font-medium focus:outline-none"
+      >
+        {ROLES.map(r => (
+          <option key={r.value} value={r.value}>{r.label}</option>
+        ))}
+      </select>
+    )
+  }
+  return (
+    <button
+      onClick={() => setEditing(true)}
+      title="Click to change role"
+      className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-${m.color}-500/10 text-${m.color}-300 ring-1 ring-${m.color}-500/30 text-[11px] font-medium hover:bg-${m.color}-500/20 transition-colors`}
+    >
+      <Icon size={11} /> {m.label}
+    </button>
+  )
+}
 
 function StatusBadge({ status, big = false }) {
   const v = {
@@ -237,6 +281,15 @@ export default function NetworkDeviceDetail() {
   }
   useEffect(() => { fetchOne() }, [id]) // eslint-disable-line
 
+  const setRole = async (role) => {
+    try {
+      const r = await api.post(`/network-devices/${id}/role`, { role })
+      setDevice(r.data)
+    } catch (e) {
+      alert(e.response?.data?.error || 'Role update failed')
+    }
+  }
+
   const test = async () => {
     setBusy('test')
     try {
@@ -303,8 +356,9 @@ export default function NetworkDeviceDetail() {
                 {device.model && <><span className="text-slate-600">·</span><span className="text-slate-400 text-sm">{device.model}</span></>}
                 {device.version && <><span className="text-slate-600">·</span><span className="text-slate-400 text-sm font-mono">IOS {device.version}</span></>}
               </div>
-              <div className="flex items-center gap-2 mt-3">
+              <div className="flex items-center gap-2 mt-3 flex-wrap">
                 <StatusBadge status={device.status} big />
+                <RoleSelector role={device.role} onChange={setRole} />
                 <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-slate-500/10 text-slate-300 ring-1 ring-slate-500/30 text-[11px] font-medium uppercase tracking-wider">
                   {device.platform}
                 </span>
@@ -345,6 +399,7 @@ export default function NetworkDeviceDetail() {
           <Row label="IOS version" value={device.version} mono />
           <Row label="Serial" value={device.serial} mono />
           <Row label="Platform" value={device.platform} />
+          <Row label="Role" value={<RoleSelector role={device.role} onChange={setRole} />} />
         </Section>
 
         <Section icon={Key} title="Management">
