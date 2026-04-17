@@ -2,7 +2,8 @@
 
 - [Project context](project_context.md) — what staxv-cluster-manager is, relationship to hypervisor, roadmap
 - [Scaffold](scaffold.md) — repo layout, port assignments, PAM service name, pkg/ duplication policy, verification
-- [Physical servers (Redfish)](servers.md) — BMC enrollment, power/inventory roadmap, security model
+- [Physical servers (Redfish)](servers.md) — BMC enrollment, power actions, hardware inventory, thermal/power sensors
+- [ISO library](isos.md) — install-media catalog, upload + URL import, BMC-facing serve route
 - [GitHub & project tracking](github.md) — labels, milestones, cross-repo conventions
 
 ## Design source of truth
