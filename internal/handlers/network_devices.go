@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +48,9 @@ func (h *NetworkDevicesHandler) Mount(r chi.Router, authMW func(http.Handler) ht
 		r.Post("/{id}/test", h.Test)
 		r.Get("/{id}/health", h.Health)
 		r.Post("/{id}/role", h.SetRole)
+		r.Get("/{id}/vlans", h.ListVLANs)
+		r.Post("/{id}/vlans", h.CreateVLAN)
+		r.Delete("/{id}/vlans/{vlan_id}", h.DeleteVLAN)
 	})
 }
 
@@ -298,6 +303,177 @@ func (h *NetworkDevicesHandler) SetRole(w http.ResponseWriter, r *http.Request) 
 	}
 	slog.Info("network device role updated", "id", id, "name", fresh.Name, "role", req.Role)
 	writeJSON(w, http.StatusOK, fresh)
+}
+
+// ─── VLAN management ─────────────────────────────────────────────
+//
+// Read-only list + single-VLAN create + single-VLAN delete. Bulk
+// ops (range syntax, batched CSV imports) are deferred. Role-gated
+// at the UI layer — handlers accept the call on any device, because
+// refusing to list VLANs on a router that might legitimately have
+// them would be wrong; but writes are admin-scoped via the outer
+// auth middleware so accidental damage on a misconfigured role is
+// the admin's own mistake, not ours to prevent.
+
+// ListVLANs returns the current `show vlan brief` output parsed into
+// [{id, name, status, ports[]}]. Empty slice when the device doesn't
+// support VLANs (e.g. pure routers — we don't 404, we return []).
+func (h *NetworkDevicesHandler) ListVLANs(w http.ResponseWriter, r *http.Request) {
+	cli, _, ok := h.clientForDevice(w, r)
+	if !ok {
+		return
+	}
+	defer cli.Close()
+	vlans, err := cli.VLANs(r.Context())
+	if err != nil {
+		h.writeCiscoErr(w, err, "list vlans")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"vlans": vlans})
+}
+
+// createVLANRequest is the enroll payload for a new VLAN.
+type createVLANRequest struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+// CreateVLAN runs `vlan <id> / name <N> / end / wr mem`. Rejects
+// invalid ID / name at the handler layer so the BMC doesn't have to
+// say "% Invalid name" for us.
+//
+// Returns the updated list of VLANs so the UI can re-render without
+// a separate round trip. Also returns before/after running-config
+// snapshots — useful for admin audit and "did it actually do
+// anything" confirmation.
+func (h *NetworkDevicesHandler) CreateVLAN(w http.ResponseWriter, r *http.Request) {
+	var req createVLANRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid body (expected {\"id\":N,\"name\":\"...\"})", http.StatusBadRequest)
+		return
+	}
+	if req.ID < cisco.VLANIDMin || req.ID > cisco.VLANIDMax {
+		writeError(w, fmt.Sprintf("vlan id %d out of range (valid: %d-%d)", req.ID, cisco.VLANIDMin, cisco.VLANIDMax), http.StatusBadRequest)
+		return
+	}
+	if req.ID >= cisco.VLANIDRsvdMin && req.ID <= cisco.VLANIDRsvdMax {
+		writeError(w, fmt.Sprintf("vlan id %d is reserved for legacy protocols (FDDI / Token Ring); pick another", req.ID), http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if !cisco.VLANNameRE.MatchString(name) {
+		writeError(w, "invalid name (1-32 chars, alphanumeric + hyphen + underscore only)", http.StatusBadRequest)
+		return
+	}
+
+	cli, devName, ok := h.clientForDevice(w, r)
+	if !ok {
+		return
+	}
+	defer cli.Close()
+
+	before, after, err := cli.CreateVLAN(r.Context(), req.ID, name)
+	if err != nil {
+		slog.Warn("vlan create failed",
+			"device", devName, "vlan_id", req.ID, "name", name,
+			"err", err, "config_before", before, "config_after", after)
+		h.writeCiscoErr(w, err, "create vlan")
+		return
+	}
+	slog.Info("vlan created",
+		"device", devName, "vlan_id", req.ID, "name", name,
+		"config_before", before, "config_after", after)
+
+	vlans, _ := cli.VLANs(r.Context())
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"vlans":         vlans,
+		"config_before": before,
+		"config_after":  after,
+	})
+}
+
+// DeleteVLAN runs `no vlan <id> / end / wr mem`. Idempotent — IOS
+// silently tolerates deleting a non-existent VLAN, matching our
+// "delete is always 204" convention.
+func (h *NetworkDevicesHandler) DeleteVLAN(w http.ResponseWriter, r *http.Request) {
+	vlanIDStr := chi.URLParam(r, "vlan_id")
+	vlanID, err := strconv.Atoi(vlanIDStr)
+	if err != nil || vlanID < cisco.VLANIDMin || vlanID > cisco.VLANIDMax {
+		writeError(w, fmt.Sprintf("invalid vlan id %q", vlanIDStr), http.StatusBadRequest)
+		return
+	}
+	// VLAN 1 is the IOS default — deleting it is rejected by the device
+	// but we double-check here for a friendlier error than a stacktrace
+	// through the Cisco reply.
+	if vlanID == 1 {
+		writeError(w, "vlan 1 is the IOS default and cannot be deleted", http.StatusBadRequest)
+		return
+	}
+
+	cli, devName, ok := h.clientForDevice(w, r)
+	if !ok {
+		return
+	}
+	defer cli.Close()
+
+	before, after, err := cli.DeleteVLAN(r.Context(), vlanID)
+	if err != nil {
+		slog.Warn("vlan delete failed",
+			"device", devName, "vlan_id", vlanID,
+			"err", err, "config_before", before, "config_after", after)
+		h.writeCiscoErr(w, err, "delete vlan")
+		return
+	}
+	slog.Info("vlan deleted",
+		"device", devName, "vlan_id", vlanID,
+		"config_before", before, "config_after", after)
+
+	vlans, _ := cli.VLANs(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"vlans":         vlans,
+		"config_before": before,
+		"config_after":  after,
+	})
+}
+
+// clientForDevice — the network-device equivalent of ServersHandler's
+// clientForServer. Resolves id param → row → decrypted creds →
+// SSH-dialed Client. Writes HTTP error on failure and returns
+// ok=false so the caller returns immediately.
+//
+// Caller MUST defer cli.Close() on success.
+func (h *NetworkDevicesHandler) clientForDevice(w http.ResponseWriter, r *http.Request) (*cisco.Client, string, bool) {
+	id, okID := parseInt64Param(w, r, "id")
+	if !okID {
+		return nil, "", false
+	}
+	dev, err := h.store.GetNetworkDevice(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, "not found", http.StatusNotFound)
+			return nil, "", false
+		}
+		writeError(w, "lookup failed", http.StatusInternalServerError)
+		return nil, "", false
+	}
+	username, password, enable, err := h.store.GetCredentials(r.Context(), id)
+	if err != nil {
+		slog.Error("clientForDevice: decrypt creds", "err", err, "id", id)
+		writeError(w, "credentials unavailable", http.StatusInternalServerError)
+		return nil, "", false
+	}
+	// r.Context() already carries the per-request timeout from
+	// middleware.Timeout (60s). That's comfortable headroom for a
+	// `show vlan brief` + 3-line config + `wr mem` on a warm SSH
+	// connection. For an operation that routinely needs more, move
+	// the handler outside the middleware.Timeout group (the pattern
+	// we used for ISO uploads).
+	cli, err := cisco.Dial(r.Context(), dev.MgmtHost, dev.MgmtPort, username, password, enable)
+	if err != nil {
+		h.writeCiscoErr(w, err, "connect")
+		return nil, "", false
+	}
+	return cli, dev.Name, true
 }
 
 // probe opens a short-lived SSH session, runs `show version`, and

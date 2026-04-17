@@ -8,10 +8,17 @@ distinct data.
 
 ## Status
 
-**Phase 1 shipped.** Enrollment, probe (`show version`), live health
-(CPU / memory / environment / interfaces). Read-only.
+**Phase 1 shipped** (commit `659a415`). Enrollment, probe (`show
+version`), live health. Read-only.
 
-Deferred for Phase 2/3 (planned; tracked below).
+**Phase 1.5 shipped** (commit `cad8681`). Role classification —
+router / switch / l3-switch / firewall / other / unknown. Autodetect
+from `show version` model string with admin-override sticky.
+
+**Phase 2 shipped.** VLAN management — list, create, delete. UI
+gated to role ∈ {switch, l3-switch}.
+
+Phase 3 (interface IPs) still deferred.
 
 ## Scope (shipped)
 
@@ -73,6 +80,28 @@ Enum (validated at the handler layer; no SQL CHECK constraint):
 
 Migration: `0007_network_device_role.sql` — `ADD COLUMN role TEXT
 NOT NULL DEFAULT 'unknown'` + index.
+
+### VLAN management (Phase 2)
+
+Read + single-VLAN write. Bulk / range syntax deferred.
+
+- `GET    /api/network-devices/{id}/vlans` — parses `show vlan brief` → `[{id, name, status, ports[]}]`. Empty slice on devices without VLAN support (we don't 404; some pure routers legitimately reject the command).
+- `POST   /api/network-devices/{id}/vlans` body `{id, name}` — validates ID 1-4094 (rejecting 1002-1005 reserved range) + name regex (1-32 chars, alnum + hyphen + underscore), then runs `configure terminal / vlan N / name X / exit / end / write memory`. Response: updated list + `config_before` + `config_after` running-config snapshots.
+- `DELETE /api/network-devices/{id}/vlans/{vlan_id}` — rejects VLAN 1 (the IOS default) client-side for a cleaner error; otherwise runs `no vlan N / end / wr mem`. Idempotent (IOS silently tolerates deleting a missing VLAN). Same response shape with snapshots.
+
+**Config-mode machinery** lives in `pkg/cisco/config.go`:
+- `RunConfigLines(lines, save bool)` — enters config mode, sends each line, detects IOS error markers (`% Invalid input`, `% Ambiguous command`, etc.) via `HasIOSError`, bails on first error while still sending `end` to leave config sub-modes cleanly, optionally runs `write memory`. No transactional rollback — classic IOS doesn't support it. Per-line replies returned for debugging.
+- `ShowRunningConfig(section)` — runs `show running-config | section <name>` (or full config when empty). Used by VLAN write methods to snapshot before/after for audit.
+
+**VLAN-layer** in `pkg/cisco/vlans.go`:
+- `VLAN` type: `{id, name, status, ports[]}`.
+- `VLANs()` — list, parses `show vlan brief` with continuation-line handling (IOS wraps long port lists across whitespace-prefixed lines with no ID; parser collapses them back onto the current row).
+- `CreateVLAN(id, name)` / `DeleteVLAN(id)` — return (before, after, err). `before` is captured even on error so the admin can see what state the device was in before the failed write.
+- `VLANNameRE` / `VLANIDMin` / `VLANIDMax` / `VLANIDRsvdMin` / `VLANIDRsvdMax` — validation constants shared with the handler.
+
+**Audit trail** — every write logs before + after running-config snapshots via `slog.Info`. On failure, `slog.Warn` captures the same plus the error. Not yet a DB-backed audit log (deferred — a `network_device_changes` table with `{timestamp, actor, device_id, op, before_config, after_config}` is the clean shape).
+
+**Role-gated UI** — the `VLANSection` component on the device detail page only renders when `device.role ∈ {switch, l3-switch}`. Pure routers don't get the section (they can still manage VLANs via CLI; this just reflects the common case). Inside the section: inline add-VLAN form with client-side validation mirroring the backend's regex + ID range, per-row delete with confirm, collapsible "Last change" revealing before/after config snapshots from the response.
 
 ### Offline bulk enrollment (CLI)
 
@@ -163,12 +192,6 @@ banner's trailing prompt.
 
 Planned but not shipped. Each its own commit:
 
-- **Phase 2 — VLAN management.**
-  - `GET  /api/network-devices/{id}/vlans` — parse `show vlan brief`
-  - `POST /api/network-devices/{id}/vlans` body `{id, name}` — `conf t / vlan N / name X / end / wr mem`
-  - `DELETE /api/network-devices/{id}/vlans/{vlan_id}` — `conf t / no vlan N / end / wr mem`
-  - UI table with inline add + delete confirm
-  - Safety: snapshot `show running-config | section vlan` before + diff after; log both
 - **Phase 3 — Interface IP management.**
   - `GET /api/network-devices/{id}/interfaces` — `show interfaces` + `show ip interface` for each; richer than the brief used in health
   - `PUT /api/network-devices/{id}/interfaces/{iface}` body `{ip, mask}` or `{clear: true}` — `conf t / interface X / [no] ip address … / no shut / end / wr mem`

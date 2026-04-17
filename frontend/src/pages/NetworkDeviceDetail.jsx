@@ -4,7 +4,7 @@ import {
   ChevronLeft, ChevronDown, ChevronRight,
   Router, RefreshCw, Trash2, CheckCircle, XCircle,
   AlertTriangle, HelpCircle, Cpu, MemoryStick, Tag, Network as NetIcon,
-  Thermometer, Key, Gauge, Activity,
+  Thermometer, Key, Gauge, Activity, Layers, Plus,
 } from 'lucide-react'
 import api from '../api'
 import { ROLES, roleMeta } from './networkRoles'
@@ -502,6 +502,234 @@ export default function NetworkDeviceDetail() {
           )
         }}
       />
+
+      {/* VLANs — role-gated to switch + l3-switch. Routers can (rarely)
+          carry VLANs via subinterfaces but that's a different admin
+          workflow; keep this section focused on the common case. Admin
+          can still manage VLANs via CLI on any device. */}
+      {(device.role === 'switch' || device.role === 'l3-switch') && (
+        <VLANSection id={id} />
+      )}
+    </div>
+  )
+}
+
+// ─── VLANs ───────────────────────────────────────────────────────
+//
+// Lazy-loaded list + inline-add + per-row delete. Writes go through
+// the backend which runs `configure terminal / vlan N / name X / end /
+// wr mem`, then returns both the new VLAN list AND before/after
+// `show running-config | section vlan` snapshots for audit. We
+// surface the updated list immediately; the snapshots go into a
+// collapsible "Changed" detail for the admin who wants to verify
+// what landed on the device.
+function VLANSection({ id }) {
+  const [vlans, setVlans] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState('')
+  const [open, setOpen] = useState(false)
+  const [adding, setAdding] = useState(false)
+  const [newVlan, setNewVlan] = useState({ id: '', name: '' })
+  const [busy, setBusy] = useState(null)        // vlan id being deleted, or 'create'
+  const [lastDiff, setLastDiff] = useState(null) // {before, after} of the last write
+
+  const load = async () => {
+    setLoading(true); setErr('')
+    try {
+      const r = await api.get(`/network-devices/${id}/vlans`)
+      setVlans(r.data.vlans || [])
+    } catch (e) {
+      setErr(e.response?.data?.error || 'Failed to load VLANs')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const toggle = () => {
+    const next = !open
+    setOpen(next)
+    if (next && vlans === null && !loading) load()
+  }
+
+  const submitAdd = async (e) => {
+    e.preventDefault()
+    setErr('')
+    const vid = parseInt(newVlan.id, 10)
+    if (!vid || vid < 1 || vid > 4094) { setErr('VLAN id must be 1-4094'); return }
+    if (!/^[A-Za-z0-9_\-]{1,32}$/.test(newVlan.name)) { setErr('Name: 1-32 chars, alphanumeric + - + _'); return }
+    setBusy('create')
+    try {
+      const r = await api.post(`/network-devices/${id}/vlans`, { id: vid, name: newVlan.name })
+      setVlans(r.data.vlans || [])
+      setLastDiff({ before: r.data.config_before, after: r.data.config_after })
+      setAdding(false); setNewVlan({ id: '', name: '' })
+    } catch (e) {
+      setErr(e.response?.data?.error || 'Create failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const remove = async (vlan) => {
+    if (!confirm(`Delete VLAN ${vlan.id} (${vlan.name})? Interfaces in this VLAN will lose membership.`)) return
+    setBusy(vlan.id); setErr('')
+    try {
+      const r = await api.delete(`/network-devices/${id}/vlans/${vlan.id}`)
+      setVlans(r.data.vlans || [])
+      setLastDiff({ before: r.data.config_before, after: r.data.config_after })
+    } catch (e) {
+      alert(e.response?.data?.error || 'Delete failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const Chevron = open ? ChevronDown : ChevronRight
+  // Reserved VLANs (1, 1002-1005) — show but disable delete.
+  const isReserved = (id) => id === 1 || (id >= 1002 && id <= 1005)
+
+  return (
+    <div className="bg-canvas-800 border border-canvas-500 rounded-xl overflow-hidden">
+      <button
+        onClick={toggle}
+        className="w-full px-5 py-3 border-b border-canvas-500 flex items-center gap-2 hover:bg-canvas-700/50 transition-colors text-left"
+      >
+        <Chevron size={14} className="text-slate-500 flex-shrink-0" />
+        <Layers size={13} className="text-brand-400 flex-shrink-0" />
+        <h3 className="text-slate-300 text-xs font-semibold tracking-wider uppercase flex-shrink-0">VLANs</h3>
+        <span className="text-slate-500 text-xs truncate">· add / delete VLANs (runs <span className="font-mono">wr mem</span>)</span>
+        {open && (
+          <span
+            role="button"
+            tabIndex={0}
+            onClick={(e) => { e.stopPropagation(); load() }}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); load() } }}
+            className="ml-auto flex items-center gap-1 text-slate-500 hover:text-brand-300 text-[11px] cursor-pointer"
+          >
+            <RefreshCw size={11} className={loading ? 'animate-spin' : ''} />
+            {loading ? 'Loading…' : 'Reload'}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div className="px-5 py-4">
+          {loading && !vlans && <div className="text-slate-500 text-sm py-6 text-center">Loading…</div>}
+          {err && (
+            <div className="bg-red-900/20 border border-red-900/40 text-red-300 text-xs rounded-lg px-3 py-2 mb-3 font-mono break-all">{err}</div>
+          )}
+
+          {vlans && (
+            <>
+              {/* Add row — inline, below the table when open */}
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-[10px] text-slate-500 tracking-wider uppercase">
+                  {vlans.length} VLAN{vlans.length !== 1 ? 's' : ''}
+                </div>
+                {!adding && (
+                  <button
+                    onClick={() => { setAdding(true); setErr('') }}
+                    className="flex items-center gap-1.5 px-3 py-1 rounded border text-xs font-semibold bg-brand-500 hover:bg-brand-400 text-canvas-900 border-transparent transition-colors"
+                  >
+                    <Plus size={12} /> Add VLAN
+                  </button>
+                )}
+              </div>
+
+              {adding && (
+                <form onSubmit={submitAdd} className="bg-canvas-900/40 border border-brand-500/40 rounded-lg px-4 py-3 mb-4 flex items-end gap-3 flex-wrap">
+                  <div>
+                    <label className="block text-[10px] font-semibold tracking-wider uppercase text-slate-400 mb-1">ID</label>
+                    <input
+                      type="number" min="2" max="4094" required
+                      value={newVlan.id}
+                      onChange={e => setNewVlan(v => ({ ...v, id: e.target.value }))}
+                      className="w-24 bg-canvas-900 border border-canvas-500 focus:border-brand-500 text-slate-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none"
+                      placeholder="e.g. 100"
+                    />
+                  </div>
+                  <div className="flex-1 min-w-[180px]">
+                    <label className="block text-[10px] font-semibold tracking-wider uppercase text-slate-400 mb-1">Name</label>
+                    <input
+                      type="text" required
+                      maxLength={32}
+                      pattern="[A-Za-z0-9_\-]+"
+                      value={newVlan.name}
+                      onChange={e => setNewVlan(v => ({ ...v, name: e.target.value }))}
+                      className="w-full bg-canvas-900 border border-canvas-500 focus:border-brand-500 text-slate-100 rounded px-3 py-1.5 text-sm font-mono focus:outline-none"
+                      placeholder="e.g. DATA"
+                    />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button type="button" onClick={() => { setAdding(false); setErr('') }}
+                            className="px-3 py-1.5 rounded text-slate-400 hover:text-slate-200 text-xs">Cancel</button>
+                    <button type="submit" disabled={busy === 'create'}
+                            className="flex items-center gap-1.5 bg-brand-500 hover:bg-brand-400 disabled:opacity-50 text-canvas-900 font-semibold px-3 py-1.5 rounded text-xs">
+                      {busy === 'create' ? <RefreshCw size={11} className="animate-spin" /> : <Plus size={11} />}
+                      Create
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              <SubTable
+                icon={Layers}
+                title="VLAN table"
+                count={vlans.length}
+                rows={vlans}
+                cols={[
+                  { header: 'ID',     render: v => <span className="font-mono text-slate-400">{v.id}</span> },
+                  { header: 'Name',   render: v => <span className="font-mono">{v.name}</span> },
+                  { header: 'Status', render: v => {
+                      const cls = v.status === 'active' ? 'bg-lime-500/10 text-lime-300 ring-lime-500/30'
+                                : v.status?.includes('unsup') ? 'bg-slate-500/10 text-slate-400 ring-slate-500/30'
+                                : 'bg-amber-500/10 text-amber-300 ring-amber-500/30'
+                      return <span className={`inline-block px-1.5 py-0.5 rounded ${cls} ring-1 text-[10px] font-medium`}>{v.status}</span>
+                    } },
+                  { header: 'Ports',  render: v => v.ports?.length ? (
+                      <span className="font-mono text-[11px] text-slate-400">
+                        {v.ports.slice(0, 4).join(', ')}
+                        {v.ports.length > 4 && <span className="text-slate-600"> +{v.ports.length - 4} more</span>}
+                      </span>
+                    ) : null },
+                  { header: '', render: v => isReserved(v.id) ? (
+                      <span className="text-slate-600 text-[10px] italic">reserved</span>
+                    ) : (
+                      <button
+                        onClick={() => remove(v)}
+                        disabled={busy !== null}
+                        className="flex items-center gap-1 px-2 py-0.5 rounded text-red-300 hover:bg-red-900/30 border border-red-700/30 text-[11px] disabled:opacity-50"
+                        title={`Delete VLAN ${v.id}`}
+                      >
+                        {busy === v.id ? <RefreshCw size={10} className="animate-spin" /> : <Trash2 size={10} />}
+                        Delete
+                      </button>
+                    ) },
+                ]}
+                empty="No VLANs reported"
+              />
+
+              {lastDiff && (
+                <details className="mt-4 text-xs text-slate-400">
+                  <summary className="cursor-pointer hover:text-slate-200">
+                    Last change — <span className="text-slate-500">before / after <span className="font-mono">show run | section vlan</span></span>
+                  </summary>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                    <div>
+                      <div className="text-[10px] font-semibold tracking-wider uppercase text-slate-500 mb-1">Before</div>
+                      <pre className="bg-canvas-900/60 border border-canvas-500 rounded p-2 overflow-x-auto text-[11px] text-slate-300 whitespace-pre">{lastDiff.before || '(empty)'}</pre>
+                    </div>
+                    <div>
+                      <div className="text-[10px] font-semibold tracking-wider uppercase text-slate-500 mb-1">After</div>
+                      <pre className="bg-canvas-900/60 border border-canvas-500 rounded p-2 overflow-x-auto text-[11px] text-slate-300 whitespace-pre">{lastDiff.after || '(empty)'}</pre>
+                    </div>
+                  </div>
+                </details>
+              )}
+            </>
+          )}
+        </div>
+      )}
     </div>
   )
 }
