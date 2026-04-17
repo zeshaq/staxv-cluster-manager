@@ -1,10 +1,9 @@
-// Package redfish is a minimal Redfish 1.x client — just enough for
-// staxv-cluster-manager to probe a BMC for reachability and pull the
-// common system fields (Manufacturer / Model / SerialNumber).
+// Package redfish is a minimal Redfish 1.x client — BMC reachability
+// probe, common system fields, and power actions (ComputerSystem.Reset).
 //
-// Power control, sensor readings, firmware, and vendor-OEM endpoints
-// (HPE iLO, Dell iDRAC, Lenovo XCC extensions) are intentionally not
-// here yet — they land as separate additions when needed.
+// Sensor readings, firmware, hardware-inventory drill-down, and
+// vendor-OEM endpoints (HPE iLO, Dell iDRAC, Lenovo XCC extensions)
+// are not here yet — they land as separate additions when needed.
 //
 // TLS
 // ───
@@ -15,6 +14,7 @@
 package redfish
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -220,6 +220,139 @@ func (c *Client) getJSON(ctx context.Context, rawURL string, out any) error {
 		return &HTTPError{Status: resp.StatusCode, Body: string(body)}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// postJSON sends a JSON body with basic auth, returns an error on
+// non-2xx. The Redfish Reset action returns 204 No Content on success
+// on most BMCs, but some return 200 + a task reference — we accept
+// any 2xx as success and don't parse the response body.
+func (c *Client) postJSON(ctx context.Context, rawURL string, body any) error {
+	buf := new(bytes.Buffer)
+	if body != nil {
+		if err := json.NewEncoder(buf).Encode(body); err != nil {
+			return err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", rawURL, buf)
+	if err != nil {
+		return err
+	}
+	req.SetBasicAuth(c.username, c.password)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("OData-Version", "4.0")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return &NetError{Err: err}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return &AuthError{Status: resp.StatusCode}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return &HTTPError{Status: resp.StatusCode, Body: string(respBody)}
+	}
+	return nil
+}
+
+// ResetType values supported by the Redfish spec. We expose the common
+// subset upstream; other values are server-side-allowlisted so an
+// operator can add uncommon ones like PowerCycle / Nmi without a
+// code change.
+const (
+	ResetOn               = "On"
+	ResetForceOff         = "ForceOff"
+	ResetGracefulShutdown = "GracefulShutdown"
+	ResetGracefulRestart  = "GracefulRestart"
+	ResetForceRestart     = "ForceRestart"
+	ResetNmi              = "Nmi"
+	ResetPowerCycle       = "PowerCycle"
+	ResetPushPowerButton  = "PushPowerButton"
+)
+
+// PowerAction fires a Redfish ComputerSystem.Reset with the given
+// resetType (one of the ResetXxx constants above).
+//
+// Flow:
+//  1. Service root → Systems collection → first system URL.
+//  2. GET the system to read its Actions."#ComputerSystem.Reset"
+//     target. Some BMCs under-populate Actions; fall back to the
+//     spec-compliant path "<system>/Actions/ComputerSystem.Reset".
+//  3. If the BMC advertises AllowableValues, validate the requested
+//     resetType against that list first so we fail fast with a useful
+//     message instead of a cryptic 400 from the BMC.
+//  4. POST {"ResetType": <value>} to the target.
+//
+// BMCs typically return 204 within a second or two; the actual power
+// state change (POST, OS boot, ACPI shutdown) takes longer. Callers
+// that want fresh state should re-probe after this returns.
+func (c *Client) PowerAction(ctx context.Context, resetType string) error {
+	if resetType == "" {
+		return errors.New("redfish: empty reset type")
+	}
+
+	// Walk to the System resource (reuses the same path as Probe).
+	var root serviceRoot
+	if err := c.getJSON(ctx, c.baseURL.String(), &root); err != nil {
+		return fmt.Errorf("service root: %w", err)
+	}
+	if root.Systems.ID == "" {
+		return errors.New("redfish: no Systems collection on this BMC")
+	}
+	var coll systemsCollection
+	if err := c.getJSON(ctx, c.absURL(root.Systems.ID), &coll); err != nil {
+		return fmt.Errorf("systems collection: %w", err)
+	}
+	if len(coll.Members) == 0 {
+		return errors.New("redfish: Systems collection is empty")
+	}
+	systemURL := coll.Members[0].ID
+
+	// Read the system's Actions block. We only need the Reset action
+	// target + allowed values, so keep the struct tight.
+	var sys struct {
+		Actions struct {
+			Reset struct {
+				Target        string   `json:"target"`
+				AllowedValues []string `json:"ResetType@Redfish.AllowableValues"`
+			} `json:"#ComputerSystem.Reset"`
+		} `json:"Actions"`
+	}
+	if err := c.getJSON(ctx, c.absURL(systemURL), &sys); err != nil {
+		return fmt.Errorf("system for reset: %w", err)
+	}
+
+	target := sys.Actions.Reset.Target
+	if target == "" {
+		// Spec-compliant fallback. Most BMCs honor this even without
+		// advertising it.
+		target = systemURL + "/Actions/ComputerSystem.Reset"
+	}
+
+	// Pre-flight against the BMC's declared allow-list if available —
+	// catches "my iLO doesn't support Nmi" locally rather than
+	// producing a 400 downstream.
+	if len(sys.Actions.Reset.AllowedValues) > 0 {
+		supported := false
+		for _, v := range sys.Actions.Reset.AllowedValues {
+			if v == resetType {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			return fmt.Errorf("redfish: BMC does not support ResetType=%q (supported: %v)",
+				resetType, sys.Actions.Reset.AllowedValues)
+		}
+	}
+
+	body := map[string]string{"ResetType": resetType}
+	if err := c.postJSON(ctx, c.absURL(target), body); err != nil {
+		return fmt.Errorf("reset %s: %w", resetType, err)
+	}
+	return nil
 }
 
 // Typed errors so the handler can map them to HTTP status codes

@@ -3,7 +3,7 @@ import { useParams, Link, useNavigate } from 'react-router-dom'
 import {
   ChevronLeft, HardDrive, RefreshCw, Trash2, CheckCircle, XCircle,
   AlertTriangle, HelpCircle, Cpu, MemoryStick, Tag, Network,
-  Power, Thermometer, Key,
+  Power, PowerOff, RotateCw, Zap, Thermometer, Key, Play, Square,
 } from 'lucide-react'
 import api from '../api'
 
@@ -72,6 +72,54 @@ function Row({ label, value, mono = false, className = '' }) {
   )
 }
 
+// ──────────────────────────────────────────────────────────────
+// Power action button. Renders a chip-style button with an icon,
+// handles confirm for destructive actions, shows a spinner while the
+// request is in flight.
+//
+// Enabled/disabled logic is explicit per-power-state so the UI matches
+// what the BMC will accept — no point in clicking "Power On" on a box
+// already running.
+// ──────────────────────────────────────────────────────────────
+function PowerButton({ action, label, icon: Icon, variant, currentState, onPerform, busy }) {
+  const tone = {
+    safe:   'bg-canvas-700 hover:bg-canvas-600 text-slate-200 border-canvas-500 hover:border-brand-500/60',
+    brand:  'bg-brand-500 hover:bg-brand-400 text-canvas-900 border-transparent',
+    danger: 'bg-red-900/30 hover:bg-red-900/50 text-red-300 border-red-700/40',
+  }[variant] || 'bg-canvas-700 text-slate-200 border-canvas-500'
+
+  // enabled-when logic — conservative. Unknown power state → enable
+  // everything so admin isn't stuck; let the BMC reject what it can't do.
+  const isOn     = currentState === 'On'
+  const isOff    = currentState === 'Off'
+  const enabled  = {
+    on:            !isOn,
+    shutdown:      !isOff,
+    reboot:        !isOff,
+    force_off:     !isOff,
+    force_reboot:  !isOff,
+  }[action] ?? true
+
+  const disabled = busy || !enabled
+
+  const run = async () => {
+    if (variant === 'danger' && !confirm(`${label} — this skips the guest OS. Continue?`)) return
+    await onPerform(action)
+  }
+
+  return (
+    <button
+      onClick={run}
+      disabled={disabled}
+      title={enabled ? label : `Not available when power state is ${currentState || 'unknown'}`}
+      className={`flex items-center gap-1.5 px-3 py-1.5 rounded border text-xs font-semibold transition-colors ${tone} disabled:opacity-40 disabled:cursor-not-allowed`}
+    >
+      {busy === action ? <RefreshCw size={12} className="animate-spin" /> : <Icon size={12} />}
+      {label}
+    </button>
+  )
+}
+
 function Section({ icon: Icon, title, children }) {
   return (
     <div className="bg-canvas-800 border border-canvas-500 rounded-xl overflow-hidden">
@@ -114,6 +162,21 @@ export default function ServerDetail() {
       setServer(r.data)
     } catch (e) {
       alert(e.response?.data?.error || 'Test failed')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  // Power action dispatcher. busy=action name while one is in flight
+  // so each button can show its own spinner and all buttons disable
+  // together (can't click Power On while Reboot is running).
+  const doPower = async (action) => {
+    setBusy(action)
+    try {
+      const r = await api.post(`/servers/${id}/power`, { action })
+      setServer(r.data)
+    } catch (e) {
+      alert(e.response?.data?.error || `Power action "${action}" failed`)
     } finally {
       setBusy(null)
     }
@@ -254,20 +317,27 @@ export default function ServerDetail() {
         </Section>
       </div>
 
-      {/* Deferred actions — flagged so the user knows more is coming */}
-      <div className="bg-canvas-800 border border-dashed border-canvas-500 rounded-xl p-5">
-        <div className="flex items-start gap-3">
-          <div className="w-8 h-8 rounded-lg bg-canvas-700 flex items-center justify-center flex-shrink-0 mt-0.5">
-            <Power size={14} className="text-slate-500" />
-          </div>
-          <div className="flex-1">
-            <h4 className="text-slate-300 text-sm font-medium">Power actions coming next</h4>
-            <p className="text-slate-500 text-xs mt-1">
-              Power On / Graceful Shutdown / Force Off / Reset — via Redfish <code className="text-slate-400 bg-canvas-700 px-1 rounded">ComputerSystem.Reset</code>. Hardware inventory drill-down (CPUs, DIMMs, disks, NICs) and thermal sensors after that.
-            </p>
-          </div>
+      {/* Power actions — Redfish ComputerSystem.Reset.
+          BMC action is synchronous(-ish): POST returns in ~1s, re-probe
+          follows to refresh power_state. UI shows transitional states
+          (PoweringOn etc.) honestly. */}
+      <Section icon={Power} title="Power actions">
+        <div className="flex flex-wrap gap-2 py-3">
+          <PowerButton action="on"           label="Power On"       icon={Play}      variant="brand"
+                       currentState={server.power_state} busy={busy} onPerform={doPower} />
+          <PowerButton action="shutdown"     label="Shutdown"       icon={Square}    variant="safe"
+                       currentState={server.power_state} busy={busy} onPerform={doPower} />
+          <PowerButton action="reboot"       label="Restart"        icon={RotateCw}  variant="safe"
+                       currentState={server.power_state} busy={busy} onPerform={doPower} />
+          <PowerButton action="force_off"    label="Force Off"      icon={PowerOff}  variant="danger"
+                       currentState={server.power_state} busy={busy} onPerform={doPower} />
+          <PowerButton action="force_reboot" label="Force Restart"  icon={Zap}       variant="danger"
+                       currentState={server.power_state} busy={busy} onPerform={doPower} />
         </div>
-      </div>
+        <p className="text-slate-500 text-[11px] pb-3 -mt-1">
+          Graceful actions ask the guest OS via ACPI. Force actions are immediate and can corrupt dirty filesystems — use only when the OS is unresponsive.
+        </p>
+      </Section>
     </div>
   )
 }

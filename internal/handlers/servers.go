@@ -41,7 +41,23 @@ func (h *ServersHandler) Mount(r chi.Router, authMW func(http.Handler) http.Hand
 		r.Get("/{id}", h.Get)
 		r.Delete("/{id}", h.Delete)
 		r.Post("/{id}/test", h.Test)
+		r.Post("/{id}/power", h.Power)
 	})
+}
+
+// powerActionMap translates UI-level action names to Redfish ResetType
+// values. Kept here (handler) rather than in pkg/redfish so the client
+// stays a thin Redfish wrapper and policy (which actions the UI knows
+// about) lives with the API surface.
+var powerActionMap = map[string]string{
+	"on":            redfish.ResetOn,
+	"shutdown":      redfish.ResetGracefulShutdown,
+	"reboot":        redfish.ResetGracefulRestart,
+	"force_off":     redfish.ResetForceOff,
+	"force_reboot":  redfish.ResetForceRestart,
+	"power_cycle":   redfish.ResetPowerCycle,
+	"nmi":           redfish.ResetNmi,
+	"push_button":   redfish.ResetPushPowerButton,
 }
 
 type enrollRequest struct {
@@ -192,6 +208,92 @@ func (h *ServersHandler) Test(w http.ResponseWriter, r *http.Request) {
 		writeError(w, "refetch failed", http.StatusInternalServerError)
 		return
 	}
+	writeJSON(w, http.StatusOK, fresh)
+}
+
+// Power issues a Redfish ComputerSystem.Reset via the BMC. The request
+// body is {"action": "<name>"} where name is one of the keys in
+// powerActionMap. On success, we re-probe so the returned Server row
+// carries the fresh power_state — users hit Power On and expect to
+// see "PoweringOn" or "On" within the same round-trip.
+//
+// Synchronous-and-slow is deliberate. A 202 + background model would
+// be nicer for UX but adds complexity (task table, polling); keep the
+// contract simple until we have real users complaining.
+func (h *ServersHandler) Power(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseInt64Param(w, r, "id")
+	if !ok {
+		return
+	}
+
+	var req struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid body (expected {\"action\":\"...\"})", http.StatusBadRequest)
+		return
+	}
+	resetType, valid := powerActionMap[req.Action]
+	if !valid {
+		valids := make([]string, 0, len(powerActionMap))
+		for k := range powerActionMap {
+			valids = append(valids, k)
+		}
+		writeError(w, "unknown action: "+req.Action+" (valid: "+strings.Join(valids, ", ")+")", http.StatusBadRequest)
+		return
+	}
+
+	srv, err := h.store.GetServer(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, "not found", http.StatusNotFound)
+			return
+		}
+		writeError(w, "lookup failed", http.StatusInternalServerError)
+		return
+	}
+	username, password, err := h.store.GetCredentials(r.Context(), id)
+	if err != nil {
+		slog.Error("power: decrypt creds", "err", err, "id", id)
+		writeError(w, "credentials unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	cli := redfish.New(srv.BMCHost, srv.BMCPort, username, password)
+	if err := cli.PowerAction(r.Context(), resetType); err != nil {
+		slog.Warn("power action failed", "id", id, "action", req.Action, "err", err)
+		// BMC errors surface as 400 — most are "already in that state"
+		// or "operation not permitted", which are user-fixable.
+		status := http.StatusBadRequest
+		if errors.As(err, new(*redfish.NetError)) {
+			status = http.StatusServiceUnavailable
+		}
+		writeError(w, "power "+req.Action+" failed: "+err.Error(), status)
+		return
+	}
+
+	// Re-probe so the response carries the fresh power_state. BMCs
+	// report transitional states ("PoweringOn") which is the HONEST
+	// answer right after a Reset — the UI shows that rather than
+	// pretending the action completed instantly.
+	probe := h.probe(r.Context(), id, srv.BMCHost, srv.BMCPort, username, password)
+	if err := h.store.UpdateReachability(r.Context(), id, probe); err != nil {
+		slog.Warn("power: post-action update reachability", "err", err, "id", id)
+	}
+	fresh, err := h.store.GetServer(r.Context(), id)
+	if err != nil {
+		// Degraded success — action went through, refetch failed.
+		// Return the pre-action row rather than an error; the client
+		// can call /test manually.
+		slog.Warn("power: refetch after action", "err", err, "id", id)
+		writeJSON(w, http.StatusOK, srv)
+		return
+	}
+
+	slog.Info("power action",
+		"id", id, "name", srv.Name, "action", req.Action, "reset_type", resetType,
+		"power_state_after", fresh.PowerState,
+	)
 	writeJSON(w, http.StatusOK, fresh)
 }
 
