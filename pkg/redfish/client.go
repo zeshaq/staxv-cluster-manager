@@ -81,19 +81,46 @@ type systemsCollection struct {
 
 // computerSystem is the subset of `ComputerSystem.v1_*_*.ComputerSystem`
 // we care about. Other vendors extend this with OEM data; we ignore.
+//
+// All fields are best-effort: BMCs vary in what they populate. Empty
+// strings / zero values are normal and the caller treats them as
+// "unknown" (rendered as "—" in the UI).
 type computerSystem struct {
 	Manufacturer string `json:"Manufacturer"`
 	Model        string `json:"Model"`
 	SerialNumber string `json:"SerialNumber"`
 	SKU          string `json:"SKU"` // Dell uses this; HPE uses SerialNumber
+	PowerState   string `json:"PowerState"`
+	BiosVersion  string `json:"BiosVersion"`
+	HostName     string `json:"HostName"`
+
+	Status struct {
+		Health string `json:"Health"`
+		State  string `json:"State"`
+	} `json:"Status"`
+
+	ProcessorSummary struct {
+		Count int `json:"Count"`
+	} `json:"ProcessorSummary"`
+
+	MemorySummary struct {
+		TotalSystemMemoryGiB float64 `json:"TotalSystemMemoryGiB"`
+	} `json:"MemorySummary"`
 }
 
 // SystemInfo is what a successful Probe returns — the fields the
-// cluster-manager UI actually displays.
+// cluster-manager UI displays. Zero values mean "BMC didn't populate
+// this" rather than an error, and render as "—" upstream.
 type SystemInfo struct {
 	Manufacturer string
 	Model        string
-	Serial       string // best-of-SerialNumber/SKU, whichever is set
+	Serial       string // best-of-SerialNumber/SKU
+	PowerState   string // "On" | "Off" | "PoweringOn" | "PoweringOff" | ""
+	Health       string // "OK" | "Warning" | "Critical" | ""
+	BIOSVersion  string
+	Hostname     string
+	CPUCount     int
+	MemoryGB     int // rounded from TotalSystemMemoryGiB
 }
 
 // Probe attempts a reachability check:
@@ -144,6 +171,17 @@ func (c *Client) Probe(ctx context.Context) (*SystemInfo, error) {
 	info.Serial = sys.SerialNumber
 	if info.Serial == "" {
 		info.Serial = sys.SKU // Dell fallback
+	}
+	info.PowerState = sys.PowerState
+	info.Health = sys.Status.Health
+	info.BIOSVersion = sys.BiosVersion
+	info.Hostname = sys.HostName
+	info.CPUCount = sys.ProcessorSummary.Count
+	// Round TotalSystemMemoryGiB to an integer. Some BMCs report
+	// fractional GiB (e.g. 1535.875 for 1.5 TiB of DIMMs); integer is
+	// plenty for the list/detail UI.
+	if sys.MemorySummary.TotalSystemMemoryGiB > 0 {
+		info.MemoryGB = int(sys.MemorySummary.TotalSystemMemoryGiB + 0.5)
 	}
 	return info, nil
 }

@@ -207,6 +207,12 @@ func (h *ServersHandler) probe(ctx context.Context, _id int64, host string, port
 			Manufacturer: info.Manufacturer,
 			Model:        info.Model,
 			Serial:       info.Serial,
+			PowerState:   info.PowerState,
+			Health:       info.Health,
+			BIOSVersion:  info.BIOSVersion,
+			Hostname:     info.Hostname,
+			CPUCount:     info.CPUCount,
+			MemoryGB:     info.MemoryGB,
 		}
 	}
 	r := &db.ProbeResult{OK: false, Err: truncateErr(err, 256)}

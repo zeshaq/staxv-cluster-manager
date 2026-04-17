@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import {
   HardDrive, Plus, Trash2, RefreshCw, X, CheckCircle, XCircle, AlertTriangle, HelpCircle,
-  Eye, EyeOff,
+  Eye, EyeOff, ChevronRight,
 } from 'lucide-react'
 import api from '../api'
 
@@ -187,19 +188,23 @@ function ServerCard({ server, onChanged }) {
   const last = server.last_seen_at ? new Date(server.last_seen_at).toLocaleString() : '—'
 
   return (
-    <div className="bg-canvas-800 border border-canvas-500 rounded-xl p-5 hover:border-brand-500/40 transition-colors">
+    <div className="bg-canvas-800 border border-canvas-500 rounded-xl p-5 hover:border-brand-500/40 transition-colors group">
+      {/* Identity row — wrapped in Link so click-anywhere-on-name jumps to detail page */}
       <div className="flex items-start justify-between mb-3 gap-3">
-        <div className="flex items-start gap-3 min-w-0">
+        <Link to={`/servers/${server.id}`} className="flex items-start gap-3 min-w-0 flex-1 hover:opacity-90">
           <div className="w-10 h-10 rounded-lg bg-brand-500/10 ring-1 ring-brand-500/30 flex items-center justify-center flex-shrink-0">
             <HardDrive size={18} className="text-brand-400" />
           </div>
           <div className="min-w-0">
-            <div className="text-slate-100 font-semibold truncate">{server.name}</div>
+            <div className="text-slate-100 font-semibold truncate group-hover:text-brand-300 transition-colors flex items-center gap-1">
+              {server.name}
+              <ChevronRight size={14} className="text-slate-600 group-hover:text-brand-400 transition-colors" />
+            </div>
             <div className="text-slate-500 text-xs font-mono truncate">
               {server.bmc_host}{server.bmc_port !== 443 && `:${server.bmc_port}`}
             </div>
           </div>
-        </div>
+        </Link>
         <StatusBadge status={server.status} />
       </div>
 

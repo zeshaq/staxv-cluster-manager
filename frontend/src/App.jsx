@@ -5,6 +5,7 @@ import Layout from './components/Layout'
 import Login from './pages/Login'
 import Home from './pages/Home'
 import Servers from './pages/Servers'
+import ServerDetail from './pages/ServerDetail'
 import Fleet from './pages/Fleet'
 import Users from './pages/Users'
 import Settings from './pages/Settings'
@@ -51,7 +52,8 @@ export default function App() {
             <Layout authState={authState} onLogout={handleLogout}>
               <Routes>
                 <Route path="/"          element={<Home />} />
-                <Route path="/servers"   element={<Servers />} />
+                <Route path="/servers"        element={<Servers />} />
+                <Route path="/servers/:id"    element={<ServerDetail />} />
                 <Route path="/fleet"     element={<Fleet />} />
                 <Route path="/users"     element={<Users />} />
                 <Route path="/settings"  element={<Settings />} />
